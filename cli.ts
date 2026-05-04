@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import * as p from "@clack/prompts";
 import color from "picocolors";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -57,6 +57,13 @@ function repoSlugFromUrl(url: string): string {
   const stripped = url.trim().replace(/\.git$/i, "");
   const part = stripped.split(/[/:]/).pop()?.replace(/\.git$/i, "") ?? "repo";
   return part || "repo";
+}
+
+function validateCommitHash(value: string | undefined): string | undefined {
+  if (value == null || !value.trim()) return "Commit hash is required";
+  const v = value.trim();
+  if (!/^[0-9a-f]{7,40}$/i.test(v)) return "Commit hash must be 7-40 hex characters";
+  return undefined;
 }
 
 async function getRemoteHeadBranch(remoteUrl: string): Promise<string | undefined> {
@@ -121,7 +128,7 @@ async function collapseToSingleCommit(cwd: string): Promise<void> {
   await execa("git", ["checkout", "--orphan", "__hardfork_orphan"], { cwd });
   await execa("git", ["add", "-A"], { cwd });
   await execa("git", ["commit", "-m", "Initial commit"], { cwd }).catch(async () => {
-    await execa("git", ["checkout", branch], { cwd }).catch(() => {});
+    await execa("git", ["checkout", branch], { cwd }).catch(() => { });
     throw new Error("Nothing to commit after orphan checkout — empty repo?");
   });
   await execa("git", ["branch", "-D", branch], { cwd });
@@ -140,12 +147,140 @@ async function cloneRepoAllBranchesShallow(url: string, dest: string): Promise<v
   await execa("git", ["clone", "--no-single-branch", "--depth", "1", url, dest], { stdio: "pipe" });
 }
 
+async function cloneRepoAllBranches(url: string, dest: string): Promise<void> {
+  await execa("git", ["clone", "--no-single-branch", url, dest], { stdio: "pipe" });
+}
+
 async function setOriginUrl(cwd: string, newUrl: string): Promise<void> {
   await execa("git", ["remote", "set-url", "origin", newUrl], { cwd });
 }
 
 async function pushToNewRemote(cwd: string, branch: string): Promise<void> {
   await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "inherit" });
+}
+
+type ExecaLikeError = {
+  shortMessage?: string;
+  message?: string;
+  stderr?: string;
+  stdout?: string;
+  all?: string;
+};
+
+function errorText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const e = err as ExecaLikeError;
+    return [e.shortMessage, e.message, e.stderr, e.stdout, e.all].filter(Boolean).join("\n");
+  }
+  return String(err);
+}
+
+function isNonFastForwardPushError(err: unknown): boolean {
+  const msg = errorText(err);
+  return (
+    msg.includes("non-fast-forward") ||
+    msg.includes("fetch first") ||
+    msg.includes("[rejected]") ||
+    msg.includes("failed to push some refs")
+  );
+}
+
+async function pushToNewRemoteCapture(cwd: string, branch: string): Promise<void> {
+  // Capture stderr so we can detect non-fast-forward reliably.
+  const res = await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "pipe", all: true });
+  if (res.all?.trim()) {
+    // Preserve git's helpful output without breaking our error parsing.
+    process.stdout.write(`${res.all}\n`);
+  }
+}
+
+async function exportHeadTreeToDir(repoCwd: string, outDir: string): Promise<void> {
+  // Export HEAD working tree without .git, preserving file modes.
+  const tarPath = join(outDir, "__hardfork_head.tar");
+  await execa("git", ["archive", "-o", tarPath, "HEAD"], { cwd: repoCwd, stdio: "pipe" });
+  await execa("tar", ["-xf", tarPath, "-C", outDir], { cwd: repoCwd, stdio: "pipe" });
+  rmSync(tarPath, { force: true });
+}
+
+async function exportCommitTreeToDir(repoCwd: string, commitSha: string, outDir: string): Promise<void> {
+  const tarPath = join(outDir, "__hardfork_commit.tar");
+  await execa("git", ["archive", "-o", tarPath, commitSha], { cwd: repoCwd, stdio: "pipe" });
+  await execa("tar", ["-xf", tarPath, "-C", outDir], { cwd: repoCwd, stdio: "pipe" });
+  rmSync(tarPath, { force: true });
+}
+
+async function preserveRemoteHistoryButReplaceFiles(params: {
+  repoCwd: string;
+  branch: string;
+  commitMessage: string;
+}): Promise<void> {
+  const { repoCwd, branch, commitMessage } = params;
+  const snapshotDir = mkdtempSync(join(tmpdir(), "hardfork-snapshot-"));
+  try {
+    await exportHeadTreeToDir(repoCwd, snapshotDir);
+
+    // Move to remote branch tip, then replace files with snapshot, commit, push.
+    await execa("git", ["fetch", "origin", branch], { cwd: repoCwd, stdio: "pipe" });
+    await execa("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: repoCwd, stdio: "pipe" });
+    removeRepoContentsExceptGit(repoCwd);
+    cpSync(snapshotDir, repoCwd, { recursive: true });
+    await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+    await execa("git", ["commit", "-m", commitMessage], { cwd: repoCwd, stdio: "pipe" });
+    await pushToNewRemote(repoCwd, branch);
+  } finally {
+    rmSync(snapshotDir, { recursive: true, force: true });
+  }
+}
+
+async function replaySourceHistoryOntoRemoteBranch(params: {
+  repoCwd: string;
+  branch: string;
+  sourceTip: string;
+  cleanupMessage: string;
+}): Promise<void> {
+  const { repoCwd, branch, sourceTip, cleanupMessage } = params;
+
+  // Snapshot source commit chain before switching branch.
+  const { stdout: revListOut } = await execa("git", ["rev-list", "--reverse", sourceTip], { cwd: repoCwd, stdio: "pipe" });
+  const sourceCommits = revListOut
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (sourceCommits.length === 0) {
+    throw new Error("Could not read source commit history to replay.");
+  }
+
+  // Move to remote branch tip and keep destination history as base.
+  await execa("git", ["fetch", "origin", branch], { cwd: repoCwd, stdio: "pipe" });
+  await execa("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: repoCwd, stdio: "pipe" });
+
+  // Separation point: destination commits remain below this cleanup commit.
+  removeRepoContentsExceptGit(repoCwd);
+  await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+  await execa("git", ["commit", "--allow-empty", "-m", cleanupMessage], { cwd: repoCwd, stdio: "pipe" });
+
+  // Replay source snapshots as a linear chain on top.
+  for (const sha of sourceCommits) {
+    const { stdout: subject } = await execa("git", ["show", "-s", "--format=%s", sha], { cwd: repoCwd, stdio: "pipe" });
+    const { stdout: originalDate } = await execa("git", ["show", "-s", "--format=%ad", "--date=iso-strict", sha], {
+      cwd: repoCwd,
+      stdio: "pipe",
+    });
+
+    removeRepoContentsExceptGit(repoCwd);
+    await exportCommitTreeToDir(repoCwd, sha, repoCwd);
+
+    await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+    const replayTitle = `${subject.trim()} / [orig ${originalDate.trim()}]`;
+    await execa("git", ["commit", "--allow-empty", "-m", `${replayTitle}\n\nsource-commit: ${sha}`], {
+      cwd: repoCwd,
+      stdio: "pipe",
+    });
+  }
+
+  await pushToNewRemote(repoCwd, branch);
 }
 
 async function pushHeadToBranch(cwd: string, branch: string): Promise<void> {
@@ -203,18 +338,30 @@ interface NukeArgv {
   _: (string | number)[];
 }
 
+interface RevertArgv {
+  repo?: string;
+  commit?: string;
+  branch?: string;
+  keepHistory?: boolean;
+  destructive?: boolean;
+  y: boolean;
+  _: (string | number)[];
+}
+
 function showHelp(): void {
   console.clear();
   p.intro(INTRO_TITLE);
   console.log(color.bold("\nUsage:"));
   console.log(`  ${color.cyan("hardfork")} ${color.dim("[options]")}`);
   console.log(`  ${color.cyan("hardfork nuke <repoUrl>")} ${color.dim("[options]")}`);
+  console.log(`  ${color.cyan("hardfork revert <repoUrl> <commit>")} ${color.dim("[options]")}`);
   console.log(`  ${color.cyan("bun run cli.ts")} ${color.dim("[options]")}`);
   p.note(
     `${color.cyan("hardfork")}\n  Interactive: source URL → clone mode → history → remote → push\n\n` +
-      `${color.cyan("hardfork --source https://github.com/you/old.git --remote git@github.com:you/new.git -y")}\n  Non-interactive with push\n\n` +
-      `${color.cyan("hardfork --source ... --temp --remote ... --no-history -y")}\n  Temp dir, single new root commit, push, delete clone\n\n` +
-      `${color.cyan("hardfork nuke https://github.com/you/repo.git")}\n  Make a repo empty (prompt preserve vs wipe history)`,
+    `${color.cyan("hardfork --source https://github.com/you/old.git --remote git@github.com:you/new.git -y")}\n  Non-interactive with push\n\n` +
+    `${color.cyan("hardfork --source ... --temp --remote ... --no-history -y")}\n  Temp dir, single new root commit, push, delete clone\n\n` +
+    `${color.cyan("hardfork nuke https://github.com/you/repo.git")}\n  Make a repo empty (prompt preserve vs wipe history)\n\n` +
+    `${color.cyan("hardfork revert https://github.com/you/repo.git <commit>")}\n  Move a branch back to a commit (force-push)`,
     "Examples",
   );
   console.log(color.bold("\nOptions:"));
@@ -429,11 +576,116 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
       const branch = await resolveBranchToPush(localPath);
       s.start(`Pushing ${branch} to origin`);
       try {
-        await pushToNewRemote(localPath, branch);
+        await pushToNewRemoteCapture(localPath, branch);
         s.stop(color.green("Pushed"));
       } catch (e) {
         s.stop(color.red("Push failed"));
-        throw e;
+        if (!isNonFastForwardPushError(e)) {
+          throw e;
+        }
+
+        if (argv.y) {
+          p.log.error("Remote rejected the push (non-fast-forward).");
+          p.log.info("Rerun without -y so you can choose how to resolve it:");
+          p.log.info(" - Force overwrite remote history");
+          p.log.info(" - Preserve remote history and replace files in a new commit");
+          throw e;
+        }
+
+        const resolution = await p.select({
+          message: "Remote is not empty. How do you want to proceed?",
+          options: [
+            {
+              value: "preserve" as const,
+              label: "Preserve remote history",
+              hint: "Keep existing commits; replace files via a new commit, then push",
+            },
+            {
+              value: "force" as const,
+              label: "Force overwrite (wipe remote history)",
+              hint: "Force-push your branch; remote commits may be lost",
+            },
+          ],
+          initialValue: "preserve",
+        });
+        if (p.isCancel(resolution)) exitCancelled();
+
+        if (resolution === "force") {
+          p.note(
+            `${color.bold("This is NOT reversible.")}\n` +
+            `Remote: ${color.cyan(newRemote)}\n` +
+            `Branch: ${color.cyan(branch)}\n` +
+            `Action: ${color.cyan("force-push overwrite")}`,
+            "Confirm force overwrite",
+          );
+          const ok = await p.confirm({
+            message: "Proceed with force-pushing and overwriting remote history?",
+            initialValue: false,
+          });
+          if (p.isCancel(ok) || !ok) exitCancelled("Push aborted");
+
+          s.start(`Force-pushing ${branch} to origin`);
+          await forcePushHeadToBranch(localPath, branch);
+          s.stop(color.green("Force-pushed"));
+        } else {
+          const preserveMode = await p.select({
+            message: "How should we preserve history?",
+            options: [
+              {
+                value: "single-commit" as const,
+                label: "Single commit on top of remote",
+                hint: "Current behavior: keep remote history, apply forked files as one commit",
+              },
+              {
+                value: "replay-source-history" as const,
+                label: "Replay source history after cleanup",
+                hint: "Destination commits stay below; then cleanup; then source commits on top",
+              },
+            ],
+            initialValue: "replay-source-history",
+          });
+          if (p.isCancel(preserveMode)) exitCancelled();
+
+          if (preserveMode === "single-commit") {
+            const msg = await p.text({
+              message: "Commit message (on top of the remote history)",
+              placeholder: "Hardfork: replace files",
+              initialValue: "Hardfork: replace files",
+              validate: (v) => (!v?.trim() ? "Commit message is required" : undefined),
+            });
+            if (p.isCancel(msg)) exitCancelled();
+
+            s.start(`Preserving remote history on ${branch}`);
+            await preserveRemoteHistoryButReplaceFiles({
+              repoCwd: localPath,
+              branch,
+              commitMessage: (msg as string).trim(),
+            });
+            s.stop(color.green("Pushed (history preserved via single commit)"));
+          } else {
+            const cleanupMsg = await p.text({
+              message: "Cleanup commit message (separates destination history)",
+              placeholder: "Hardfork: cleanup before replaying source history",
+              initialValue: "Hardfork: cleanup before replaying source history",
+              validate: (v) => (!v?.trim() ? "Cleanup commit message is required" : undefined),
+            });
+            if (p.isCancel(cleanupMsg)) exitCancelled();
+
+            const { stdout: sourceTip } = await execa("git", ["rev-parse", "HEAD"], {
+              cwd: localPath,
+              stdio: "pipe",
+            });
+
+            s.start(`Replaying source history on top of ${branch}`);
+            await replaySourceHistoryOntoRemoteBranch({
+              repoCwd: localPath,
+              branch,
+              sourceTip: sourceTip.trim(),
+              cleanupMessage: (cleanupMsg as string).trim(),
+            });
+            s.stop(color.green("Pushed (source history replayed)"));
+          }
+        }
       }
     }
   } catch (e) {
@@ -561,10 +813,10 @@ async function runNuke(argv: NukeArgv): Promise<void> {
 
   p.note(
     `${warningLine}` +
-      `Mode: ${color.cyan(modeLabel)}\n` +
-      `Repo: ${color.cyan(repo)}\n` +
-      `Commit: ${color.cyan(commitMessage)}\n` +
-      `Branches (${plannedBranches.length}):\n${shownBranches}`,
+    `Mode: ${color.cyan(modeLabel)}\n` +
+    `Repo: ${color.cyan(repo)}\n` +
+    `Commit: ${color.cyan(commitMessage)}\n` +
+    `Branches (${plannedBranches.length}):\n${shownBranches}`,
     summaryTitle,
   );
 
@@ -646,6 +898,167 @@ async function runNuke(argv: NukeArgv): Promise<void> {
   p.outro(color.green("nuke complete"));
 }
 
+async function runRevert(argv: RevertArgv): Promise<void> {
+  console.clear();
+  p.intro(INTRO_TITLE);
+
+  const repo =
+    argv.repo?.trim() || (argv._[1] != null && String(argv._[1]).trim() !== "" ? String(argv._[1]).trim() : undefined);
+  const commit =
+    argv.commit?.trim() ||
+    (argv._[2] != null && String(argv._[2]).trim() !== "" ? String(argv._[2]).trim() : undefined);
+
+  if (!repo) {
+    p.log.error("Repo URL is required (hardfork revert <repoUrl> <commit>)");
+    process.exit(1);
+  }
+  const repoErr = validateRemoteUrl(repo);
+  if (repoErr) {
+    p.log.error(repoErr);
+    process.exit(1);
+  }
+
+  if (!commit) {
+    p.log.error("Commit hash is required (hardfork revert <repoUrl> <commit>)");
+    process.exit(1);
+  }
+  const commitErr = validateCommitHash(commit);
+  if (commitErr) {
+    p.log.error(commitErr);
+    process.exit(1);
+  }
+
+  const defaultBranch = (await getRemoteHeadBranch(repo)) || "main";
+  let branch = argv.branch?.trim();
+  if (!branch && !argv.y) {
+    const b = await p.text({
+      message: "Branch to revert",
+      placeholder: defaultBranch,
+      initialValue: defaultBranch,
+      validate: (v) => (!v?.trim() ? "Branch is required" : undefined),
+    });
+    if (p.isCancel(b)) exitCancelled();
+    branch = (b as string).trim();
+  }
+  if (!branch) branch = defaultBranch;
+
+  type RevertMode = "keep-history" | "destructive";
+  let mode: RevertMode = "destructive";
+  if (argv.keepHistory && argv.destructive) {
+    p.log.error("Use only one of --keep-history or --destructive");
+    process.exit(1);
+  }
+  if (argv.keepHistory) mode = "keep-history";
+  else if (argv.destructive) mode = "destructive";
+  else if (!argv.y) {
+    const m = await p.select({
+      message: "Revert mode",
+      options: [
+        {
+          value: "keep-history" as const,
+          label: "Keep history (non-destructive)",
+          hint: "Creates new revert commit(s); does not rewrite history",
+        },
+        {
+          value: "destructive" as const,
+          label: "Destructive revert",
+          hint: "Hard-resets to the commit and force-pushes (rewrites history)",
+        },
+      ],
+      initialValue: "keep-history",
+    });
+    if (p.isCancel(m)) exitCancelled();
+    mode = m as RevertMode;
+  }
+
+  const warningLine = mode === "destructive" ? `${color.bold("This is NOT reversible.")}\n` : "";
+  const actionLabel =
+    mode === "destructive"
+      ? "hard reset + force-push branch to commit"
+      : "revert commits after target (new commit(s))";
+
+  p.note(
+    `${warningLine}` +
+    `Action: ${color.cyan(actionLabel)}\n` +
+    `Repo: ${color.cyan(repo)}\n` +
+    `Branch: ${color.cyan(branch)}\n` +
+    `Commit: ${color.cyan(commit)}`,
+    "Confirm revert",
+  );
+
+  if (!argv.y) {
+    const ok = await p.confirm({
+      message:
+        mode === "destructive"
+          ? "Proceed with rewriting history (force-push) for that branch?"
+          : "Proceed with creating revert commit(s) on that branch?",
+      initialValue: mode !== "destructive",
+    });
+    if (p.isCancel(ok) || !ok) exitCancelled("Revert aborted");
+  }
+
+  const cwd = mkdtempSync(join(tmpdir(), "hardfork-revert-"));
+  const s = p.spinner();
+
+  try {
+    s.start("Cloning repo (temp)");
+    await cloneRepoAllBranches(repo, cwd);
+    s.stop(color.green("Cloned"));
+
+    s.start(`Checking out ${branch}`);
+    await execa("git", ["fetch", "origin", branch], { cwd, stdio: "pipe" });
+    await execa("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd, stdio: "pipe" });
+    s.stop(color.green("Checked out"));
+
+    // Ensure commit object exists locally; this handles cases where commit isn't on the fetched branch tip.
+    await execa("git", ["fetch", "origin", commit], { cwd, stdio: "pipe" }).catch(() => { });
+
+    if (mode === "destructive") {
+      s.start("Resetting to commit");
+      await execa("git", ["reset", "--hard", commit], { cwd, stdio: "pipe" });
+      s.stop(color.green("Reset"));
+
+      s.start(`Force-pushing to origin/${branch}`);
+      await forcePushHeadToBranch(cwd, branch);
+      s.stop(color.green("Pushed"));
+    } else {
+      s.start("Verifying commit is an ancestor of branch");
+      const isAncestor = await execa("git", ["merge-base", "--is-ancestor", commit, "HEAD"], { cwd, stdio: "pipe" })
+        .then(() => true)
+        .catch(() => false);
+      if (!isAncestor) {
+        throw new Error(
+          `Commit ${commit} is not an ancestor of ${branch}. Use --destructive to force-move, or pick a commit on that branch.`,
+        );
+      }
+      s.stop(color.green("OK"));
+
+      s.start("Reverting commits after target");
+      const { stdout } = await execa("git", ["rev-list", "--reverse", `${commit}..HEAD`], { cwd, stdio: "pipe" });
+      const toRevert = stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+      for (const sha of toRevert) {
+        await execa("git", ["revert", "--no-edit", sha], { cwd, stdio: "pipe" });
+      }
+      s.stop(color.green("Reverted"));
+
+      s.start(`Pushing to origin/${branch}`);
+      await pushToNewRemote(cwd, branch);
+      s.stop(color.green("Pushed"));
+    }
+  } catch (e) {
+    s.stop(color.red("Revert failed"));
+    p.log.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+
+  p.outro(color.green("revert complete"));
+}
+
 async function main(): Promise<void> {
   const parsed = yargs(hideBin(process.argv))
     .help(false)
@@ -662,6 +1075,15 @@ async function main(): Promise<void> {
           type: "string",
           describe: "Commit message for the nuke commit",
         })
+        .option("y", { alias: "yes", type: "boolean", default: false }),
+    )
+    .command("revert <repo> <commit>", "Force-move a branch to a commit", (yy) =>
+      yy
+        .positional("repo", { type: "string", describe: "Target repo URL (GitHub/GitLab)" })
+        .positional("commit", { type: "string", describe: "Commit hash to move the branch to" })
+        .option("branch", { type: "string", describe: "Branch to move (default: remote HEAD or main)" })
+        .option("keep-history", { type: "boolean", default: false, describe: "Revert via new commit(s) (no rewrite)" })
+        .option("destructive", { type: "boolean", default: false, describe: "Hard reset + force-push (rewrites history)" })
         .option("y", { alias: "yes", type: "boolean", default: false }),
     )
     .option("source", { type: "string", description: "Source repository URL" })
@@ -691,6 +1113,10 @@ async function main(): Promise<void> {
   const first = String((parsed._[0] ?? "") as string);
   if (first === "nuke") {
     await runNuke(parsed as unknown as NukeArgv);
+    return;
+  }
+  if (first === "revert") {
+    await runRevert(parsed as unknown as RevertArgv);
     return;
   }
   await runHardfork(parsed as unknown as ParsedArgv);
