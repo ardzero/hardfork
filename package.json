@@ -1,8 +1,8 @@
 {
   "name": "hardfork",
-  "description": "CLI to hard-fork a GitHub/GitLab repo: clone, optional fresh history, new remote, push.",
+  "description": "A utility CLI that lets you hard-fork/nuke/revert/merge histories on a GitHub/GitLab repo with interactive promts.",
   "author": "Ard Astroid <ardastroid@gmail.com>",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -17,9 +17,28 @@
   "scripts": {
     "dev": "bun run cli.ts",
     "build": "bun build cli.ts --outdir dist --target node --minify --sourcemap=external",
+    "gen:publish-workflow": "bun run publish-workflow-gen.ts",
     "prepublishOnly": "bun run build"
   },
-  "keywords": ["cli", "git", "fork", "github", "gitlab", "bun"],
+  "keywords": [
+    "cli",
+    "git",
+    "fork",
+    "github",
+    "gitlab",
+    "bunx",
+    "hard fork",
+    "nuke",
+    "revert",
+    "merge",
+    "history",
+    "git",
+    "github",
+    "gitlab",
+    "remote",
+    "fork",
+    "npx"
+  ],
   "dependencies": {
     "@clack/prompts": "^1.3.0",
     "execa": "^9.6.1",
