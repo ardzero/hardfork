@@ -37,7 +37,8 @@
     "gitlab",
     "remote",
     "fork",
-    "npx"
+    "npx",
+    "hardfork"
   ],
   "devDependencies": {
     "@clack/prompts": "^1.3.0",
