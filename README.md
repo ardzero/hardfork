@@ -1,6 +1,6 @@
 # hardfork
 
-An ppen-source CLI utility tool for having a beautiful interactive command line ui for hard-forking or nuking a repo. It also has a revert helper that give you an interactive ui to revert to specifc commit hashes.
+An open-source CLI utility tool for having a beautiful interactive command line ui for hard-forking or nuking a repo. It also has a revert helper that give you an interactive ui to revert to specifc commit hashes.
 
 ### Requirement
 
