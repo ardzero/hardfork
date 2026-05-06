@@ -8,8 +8,6 @@ on:
     paths:
       - "cli.ts"
       - "package.json"
-      - "bun.lock"
-      - "README.md"
       - ".github/workflows/publish-package.yml"
 
 permissions:

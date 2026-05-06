@@ -16,8 +16,6 @@ const workflowConfig = {
   watchPaths: [
     "cli.ts",
     "package.json",
-    "bun.lock",
-    "README.md",
     // workflow file path is auto appended
   ],
   nodeVersion: "24",
