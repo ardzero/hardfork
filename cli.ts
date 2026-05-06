@@ -61,6 +61,170 @@ function repoSlugFromUrl(url: string): string {
   return part || "repo";
 }
 
+type SourceRepo = {
+  cloneUrl: string;
+  branch?: string;
+  host?: "github" | "gitlab";
+  owner?: string;
+  repo?: string;
+};
+
+function parseSourceRepo(input: string): SourceRepo {
+  const source = input.trim();
+  try {
+    const url = new URL(source);
+    const parts = url.pathname.split("/").filter(Boolean);
+    const treeIndex = parts.indexOf("tree");
+    const gitlabTreeIndex = parts.findIndex((part, idx) => part === "tree" && parts[idx - 1] === "-");
+
+    if ((url.hostname === "github.com" || url.hostname === "gitlab.com") && parts.length >= 2) {
+      const owner = parts[0];
+      const repo = parts[1]?.replace(/\.git$/i, "");
+      const branchStart = treeIndex >= 2 ? treeIndex + 1 : gitlabTreeIndex >= 3 ? gitlabTreeIndex + 1 : -1;
+      const branch = branchStart > 0 ? parts.slice(branchStart).join("/") : undefined;
+      return {
+        cloneUrl: `${url.protocol}//${url.hostname}/${owner}/${repo}.git`,
+        branch,
+        host: url.hostname === "github.com" ? "github" : "gitlab",
+        owner,
+        repo,
+      };
+    }
+  } catch {
+    // SSH URLs and plain clone URLs are already acceptable git inputs.
+  }
+  return { cloneUrl: source };
+}
+
+type RepoPreflight = {
+  branchCount: number;
+  sizeKb?: number;
+  commitCount?: number;
+  source?: string;
+};
+
+async function getRepoSizeKb(source: SourceRepo): Promise<{ sizeKb?: number; source?: string }> {
+  if (!source.owner || !source.repo) return {};
+  try {
+    if (source.host === "github") {
+      const res = await fetch(`https://api.github.com/repos/${source.owner}/${source.repo}`, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "hardfork-cli" },
+      });
+      if (!res.ok) return {};
+      const data = (await res.json()) as { size?: unknown };
+      return typeof data.size === "number" ? { sizeKb: data.size, source: "GitHub" } : {};
+    }
+    if (source.host === "gitlab") {
+      const project = encodeURIComponent(`${source.owner}/${source.repo}`);
+      const res = await fetch(`https://gitlab.com/api/v4/projects/${project}`, {
+        headers: { "User-Agent": "hardfork-cli" },
+      });
+      if (!res.ok) return {};
+      const data = (await res.json()) as { statistics?: { repository_size?: unknown } };
+      const bytes = data.statistics?.repository_size;
+      return typeof bytes === "number" ? { sizeKb: Math.round(bytes / 1024), source: "GitLab" } : {};
+    }
+  } catch {
+    return {};
+  }
+  return {};
+}
+
+function parseLastPageFromLinkHeader(link: string | null): number | undefined {
+  if (!link) return undefined;
+  const last = link
+    .split(",")
+    .map((part) => part.trim())
+    .find((part) => part.includes('rel="last"'));
+  const match = last?.match(/[?&]page=(\d+)/);
+  return match ? Number(match[1]) : undefined;
+}
+
+async function getRepoCommitCount(source: SourceRepo, branch?: string): Promise<{ commitCount?: number }> {
+  if (!source.owner || !source.repo) return {};
+  try {
+    if (source.host === "github") {
+      const url = new URL(`https://api.github.com/repos/${source.owner}/${source.repo}/commits`);
+      url.searchParams.set("per_page", "1");
+      if (branch) url.searchParams.set("sha", branch);
+      const res = await fetch(url, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "hardfork-cli" },
+      });
+      if (!res.ok) return {};
+      return { commitCount: parseLastPageFromLinkHeader(res.headers.get("link")) };
+    }
+    if (source.host === "gitlab") {
+      const project = encodeURIComponent(`${source.owner}/${source.repo}`);
+      const url = new URL(`https://gitlab.com/api/v4/projects/${project}/repository/commits`);
+      url.searchParams.set("per_page", "1");
+      if (branch) url.searchParams.set("ref_name", branch);
+      const res = await fetch(url, { headers: { "User-Agent": "hardfork-cli" } });
+      if (!res.ok) return {};
+      const total = Number(res.headers.get("x-total"));
+      return Number.isFinite(total) && total > 0 ? { commitCount: total } : {};
+    }
+  } catch {
+    return {};
+  }
+  return {};
+}
+
+function formatSizeKb(sizeKb: number): string {
+  if (sizeKb >= 1024 * 1024) return `${(sizeKb / 1024 / 1024).toFixed(1)} GB`;
+  if (sizeKb >= 1024) return `${(sizeKb / 1024).toFixed(1)} MB`;
+  return `${sizeKb} KB`;
+}
+
+function allBranchesLooksExpensive(preflight: RepoPreflight): boolean {
+  const sizeKb = preflight.sizeKb ?? 0;
+  return preflight.branchCount > 20 || sizeKb > 500 * 1024;
+}
+
+function fullHistoryLooksExpensive(preflight: RepoPreflight): boolean {
+  const sizeKb = preflight.sizeKb ?? 0;
+  const commitCount = preflight.commitCount ?? 0;
+  return commitCount > 3000 || sizeKb > 500 * 1024;
+}
+
+function parseCommitDepth(value: string | number | undefined): number | undefined {
+  if (value == null || value === "") return undefined;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+function estimateTransferSizeKb(params: {
+  preflight: RepoPreflight;
+  withHistory: boolean;
+  historyDepth?: number;
+  branchScope: BranchScope;
+  selectedBranchCount?: number;
+}): number | undefined {
+  const { preflight, withHistory, historyDepth, branchScope, selectedBranchCount } = params;
+  if (!preflight.sizeKb) return undefined;
+  if (!withHistory) return Math.max(1, Math.round(preflight.sizeKb * 0.05));
+  if (!historyDepth || !preflight.commitCount) return preflight.sizeKb;
+
+  const historyRatio = Math.min(1, historyDepth / preflight.commitCount);
+  const branchRatio =
+    branchScope === "all"
+      ? 1
+      : Math.max(0.2, (branchScope === "specific" ? selectedBranchCount || 1 : 1) / Math.max(1, preflight.branchCount || 1));
+  return Math.max(1, Math.round(preflight.sizeKb * historyRatio * branchRatio));
+}
+
+function describeHistoryChoice(withHistory: boolean, historyDepth?: number): string {
+  if (!withHistory) return "single fresh commit";
+  if (historyDepth) return `latest ${historyDepth.toLocaleString()} commits`;
+  return "full history";
+}
+
+function branchOptions(sourceBranches: string[], sourceBranch?: string): { value: string; label: string }[] {
+  const ordered = sourceBranch
+    ? [sourceBranch, ...sourceBranches.filter((branch) => branch !== sourceBranch)]
+    : sourceBranches;
+  return ordered.map((branch) => ({ value: branch, label: branch }));
+}
+
 function validateCommitHash(value: string | undefined): string | undefined {
   if (value == null || !value.trim()) return "Commit hash is required";
   const v = value.trim();
@@ -144,11 +308,35 @@ async function collapseToSingleCommit(cwd: string): Promise<void> {
   await execa("git", ["branch", "-m", branch], { cwd });
 }
 
-async function cloneRepo(url: string, dest: string, withHistory: boolean): Promise<void> {
+async function cloneRepo(
+  url: string,
+  dest: string,
+  withHistory: boolean,
+  branch: string | undefined,
+  allBranches: boolean,
+  depth?: number,
+): Promise<void> {
   const args = ["clone"];
-  if (!withHistory) args.push("--depth", "1");
+  args.push("--no-tags");
+  if (allBranches) {
+    args.push("--no-single-branch");
+  } else {
+    args.push("--single-branch");
+    if (branch) args.push("--branch", branch);
+  }
+  if (depth) args.push("--depth", String(depth));
+  else if (!withHistory) args.push("--depth", "1");
   args.push(url, dest);
   await execa("git", args, { stdio: "pipe" });
+}
+
+async function fetchSpecificBranches(cwd: string, branches: string[], depth?: number): Promise<void> {
+  for (const branch of branches) {
+    const args = ["fetch", "origin"];
+    if (depth) args.push("--depth", String(depth));
+    args.push(`refs/heads/${branch}:refs/remotes/origin/${branch}`);
+    await execa("git", args, { cwd, stdio: "pipe" });
+  }
 }
 
 async function cloneRepoAllBranchesShallow(url: string, dest: string): Promise<void> {
@@ -201,6 +389,29 @@ async function pushToNewRemoteCapture(cwd: string, branch: string): Promise<void
   if (res.all?.trim()) {
     // Preserve git's helpful output without breaking our error parsing.
     process.stdout.write(`${res.all}\n`);
+  }
+}
+
+async function listClonedSourceBranches(cwd: string): Promise<string[]> {
+  const { stdout } = await execa("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"], {
+    cwd,
+    stdio: "pipe",
+  });
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((ref) => ref !== "origin/HEAD")
+    .map((ref) => ref.replace(/^origin\//, ""))
+    .filter(Boolean);
+}
+
+async function pushClonedSourceBranches(cwd: string, branches: string[]): Promise<void> {
+  for (const branch of branches) {
+    await execa("git", ["push", "-u", "origin", `refs/remotes/origin/${branch}:refs/heads/${branch}`], {
+      cwd,
+      stdio: "inherit",
+    });
   }
 }
 
@@ -322,16 +533,21 @@ function validateLocalDir(name: string | undefined): string | undefined {
 }
 
 type CloneMode = "temp" | "normal";
+type BranchScope = "current" | "specific" | "all";
 type NukeMode = "preserve" | "wipe";
 
 interface ParsedArgv {
   source?: string;
   remote?: string;
   dir?: string;
+  branch?: string;
   temp?: boolean;
   normal?: boolean;
   history?: boolean;
   noHistory?: boolean;
+  depth?: number;
+  allBranches?: boolean;
+  currentBranchOnly?: boolean;
   push?: boolean;
   noPush?: boolean;
   y: boolean;
@@ -381,10 +597,14 @@ function showHelp(): void {
   console.log(`  ${color.cyan("--source <url>")}     Source repo (GitHub/GitLab)`);
   console.log(`  ${color.cyan("--remote <url>")}    Your new empty repo URL (required for --temp)`);
   console.log(`  ${color.cyan("--dir <path>")}      Clone destination (normal mode); default: repo name`);
+  console.log(`  ${color.cyan("--branch <name>")}   Source branch to clone; inferred from /tree/<branch> URLs`);
+  console.log(`  ${color.cyan("--all-branches")}    Clone and push all source branches (history mode only)`);
+  console.log(`  ${color.cyan("--current-branch-only")} Fast path: clone and push one branch only`);
   console.log(`  ${color.cyan("--temp")}            Clone in a temp folder and delete after push`);
   console.log(`  ${color.cyan("--normal")}           Keep local clone (default)`);
   console.log(`  ${color.cyan("--history")}          Full clone with history (default)`);
   console.log(`  ${color.cyan("--no-history")}       Single new commit (no lineage)`);
+  console.log(`  ${color.cyan("--depth <n>")}        Keep only the latest n commits of source history`);
   console.log(`  ${color.cyan("--push")}             Push to new remote after wiring`);
   console.log(`  ${color.cyan("--no-push")}          Only set remote URL`);
   console.log(`  ${color.cyan("-y, --yes")}         Skip prompts (needs required flags)`);
@@ -421,6 +641,17 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
     p.log.error(srcErr);
     process.exit(1);
   }
+  const sourceRepo = parseSourceRepo(source);
+  const sourceCloneUrl = sourceRepo.cloneUrl;
+  const sourceBranch = argv.branch?.trim() || sourceRepo.branch;
+  const sourceBranches = await listRemoteBranches(sourceCloneUrl).catch(() => []);
+  const repoSize = await getRepoSizeKb(sourceRepo);
+  const commitCount = await getRepoCommitCount(sourceRepo, sourceBranch);
+  const preflight: RepoPreflight = {
+    branchCount: sourceBranches.length,
+    ...repoSize,
+    ...commitCount,
+  };
 
   let cloneMode: CloneMode = "normal";
   if (argv.temp && argv.normal) {
@@ -451,12 +682,21 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
   }
 
   let withHistory = true;
+  let historyDepth = parseCommitDepth(argv.depth);
+  if (argv.depth != null && !historyDepth) {
+    p.log.error("--depth must be a positive integer");
+    process.exit(1);
+  }
   if (argv.history && argv.noHistory) {
     p.log.error("Use only one of --history or --no-history");
     process.exit(1);
   }
+  if (argv.noHistory && historyDepth) {
+    p.log.error("Use only one of --no-history or --depth");
+    process.exit(1);
+  }
   if (argv.noHistory) withHistory = false;
-  else if (argv.history) withHistory = true;
+  else if (argv.history || historyDepth) withHistory = true;
   else if (!argv.y) {
     const hist = await p.confirm({
       message: "Preserve full commit history from the source?",
@@ -464,6 +704,331 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
     });
     if (p.isCancel(hist)) exitCancelled();
     withHistory = hist as boolean;
+  }
+
+  if (withHistory && fullHistoryLooksExpensive(preflight)) {
+    const detail = [
+      preflight.commitCount ? `Commits: ${color.cyan(preflight.commitCount.toLocaleString())}` : undefined,
+      preflight.sizeKb ? `Size: ${color.cyan(formatSizeKb(preflight.sizeKb))}` : undefined,
+      preflight.branchCount ? `Branches: ${color.cyan(String(preflight.branchCount))}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    if (argv.y || argv.history) {
+      p.log.warn("This repo looks large; preserving full history can take a long time.");
+      if (detail) p.log.info(detail);
+    } else {
+      p.note(
+        `${detail || "This repo has a large reported history/size."}\n\n` +
+          `You can keep full history, keep only recent commits, or use a single fresh commit.`,
+        "Large commit history",
+      );
+      const historyRoute = await p.select({
+        message: "How much source history should be kept?",
+        options: [
+          { value: "fast" as const, label: "Fast route", hint: "No source commit lineage; one fresh commit" },
+          { value: "limited" as const, label: "Limited history", hint: "Keep only the latest N commits" },
+          { value: "history" as const, label: "Preserve full history", hint: "Can take a long time" },
+        ],
+        initialValue: "limited",
+      });
+      if (p.isCancel(historyRoute)) exitCancelled();
+      if (historyRoute === "fast") {
+        withHistory = false;
+      } else if (historyRoute === "limited") {
+        const defaultDepth = preflight.commitCount ? Math.min(1000, preflight.commitCount) : 1000;
+        const depth = await p.text({
+          message: "How many recent commits should be kept?",
+          placeholder: String(defaultDepth),
+          initialValue: String(defaultDepth),
+          validate: (value) => (parseCommitDepth(value) ? undefined : "Enter a positive integer"),
+        });
+        if (p.isCancel(depth)) exitCancelled();
+        historyDepth = parseCommitDepth(depth as string);
+        withHistory = true;
+      } else {
+        withHistory = true;
+      }
+    }
+  }
+
+  let branchScope: BranchScope = "current";
+  let selectedBranches: string[] = sourceBranch ? [sourceBranch] : [];
+  if (argv.allBranches && argv.currentBranchOnly) {
+    p.log.error("Use only one of --all-branches or --current-branch-only");
+    process.exit(1);
+  }
+  if (argv.allBranches && !withHistory) {
+    p.log.error("--all-branches requires history; --no-history creates one new root commit for one branch.");
+    process.exit(1);
+  }
+  if (argv.allBranches) branchScope = "all";
+  else if (argv.currentBranchOnly) branchScope = "current";
+  else if (withHistory && !argv.y && sourceBranches.length > 1) {
+    const looksExpensive = allBranchesLooksExpensive(preflight);
+    const sizeLabel = preflight.sizeKb ? `${formatSizeKb(preflight.sizeKb)} ${preflight.source ?? "reported"} repo` : "unknown repo size";
+    const scope = await p.select({
+      message: "Which branches should be included?",
+      options: [
+        {
+          value: "current" as const,
+          label: sourceBranch ? `Fast: only ${sourceBranch}` : "Fast: only the default branch",
+          hint: "Recommended; one branch, no tags",
+        },
+        {
+          value: "specific" as const,
+          label: "Pick specific branches",
+          hint: "Choose one or more branches",
+        },
+        {
+          value: "all" as const,
+          label: `All branches (${sourceBranches.length})`,
+          hint: looksExpensive ? `Likely slow: ${sizeLabel}` : `Reasonable: ${sizeLabel}`,
+        },
+      ],
+      initialValue: "current",
+    });
+    if (p.isCancel(scope)) exitCancelled();
+    branchScope = scope as BranchScope;
+    if (branchScope === "specific") {
+      const pickedBranches = await p.multiselect({
+        message: "Which branches should be included?",
+        options: branchOptions(sourceBranches, sourceBranch),
+        initialValues: selectedBranches.length ? selectedBranches : sourceBranch ? [sourceBranch] : [],
+        required: true,
+      });
+      if (p.isCancel(pickedBranches)) exitCancelled();
+      selectedBranches = pickedBranches as string[];
+    }
+
+    while (branchScope === "all" && looksExpensive) {
+      p.note(
+        `This repo looks expensive to hard fork with every branch.\n` +
+          `Branches: ${color.cyan(String(preflight.branchCount))}\n` +
+          `Size: ${color.cyan(preflight.sizeKb ? formatSizeKb(preflight.sizeKb) : "unknown")}\n\n` +
+          `Fast route keeps only ${color.cyan(sourceBranch ?? "the default branch")} and skips tags.`,
+        "Large all-branches clone",
+      );
+      const route = await p.select({
+        message: "Continue with all branches, use the fast route, or reconfigure?",
+        options: [
+          { value: "current" as const, label: "Use fast route", hint: "One branch only" },
+          { value: "reconfigure" as const, label: "Reconfigure", hint: "Change commit depth and branch choice" },
+          { value: "all" as const, label: "Continue with all branches", hint: "Can take a long time" },
+        ],
+        initialValue: "reconfigure",
+      });
+      if (p.isCancel(route)) exitCancelled();
+      if (route === "current") {
+        branchScope = "current";
+      } else if (route === "all") {
+        break;
+      } else {
+        const historyRoute = await p.select({
+          message: "How much source history should be kept?",
+          options: [
+            { value: "fast" as const, label: "Fast route", hint: "No source commit lineage; one fresh commit" },
+            { value: "limited" as const, label: "Limited history", hint: "Keep only the latest N commits" },
+            { value: "history" as const, label: "Preserve full history", hint: "Can take a long time" },
+          ],
+          initialValue: historyDepth ? "limited" : withHistory ? "history" : "fast",
+        });
+        if (p.isCancel(historyRoute)) exitCancelled();
+        if (historyRoute === "fast") {
+          withHistory = false;
+          historyDepth = undefined;
+          branchScope = "current";
+          break;
+        }
+        if (historyRoute === "limited") {
+          const defaultDepth = historyDepth ?? (preflight.commitCount ? Math.min(1000, preflight.commitCount) : 1000);
+          const depth = await p.text({
+            message: "How many recent commits should be kept?",
+            placeholder: String(defaultDepth),
+            initialValue: String(defaultDepth),
+            validate: (value) => (parseCommitDepth(value) ? undefined : "Enter a positive integer"),
+          });
+          if (p.isCancel(depth)) exitCancelled();
+          historyDepth = parseCommitDepth(depth as string);
+          withHistory = true;
+        } else {
+          historyDepth = undefined;
+          withHistory = true;
+        }
+
+        const nextScope = await p.select({
+          message: "Which branches should be included?",
+          options: [
+            {
+              value: "current" as const,
+              label: sourceBranch ? `Fast: only ${sourceBranch}` : "Fast: only the default branch",
+              hint: "Recommended; one branch, no tags",
+            },
+            {
+              value: "specific" as const,
+              label: "Pick specific branches",
+              hint: "Choose one or more branches",
+            },
+            {
+              value: "all" as const,
+              label: `All branches (${sourceBranches.length})`,
+              hint: `Likely slow: ${sizeLabel}`,
+            },
+          ],
+          initialValue: "current",
+        });
+        if (p.isCancel(nextScope)) exitCancelled();
+        branchScope = nextScope as BranchScope;
+        if (branchScope === "specific") {
+          const pickedBranches = await p.multiselect({
+            message: "Which branches should be included?",
+            options: branchOptions(sourceBranches, sourceBranch),
+            initialValues: selectedBranches.length ? selectedBranches : sourceBranch ? [sourceBranch] : [],
+            required: true,
+          });
+          if (p.isCancel(pickedBranches)) exitCancelled();
+          selectedBranches = pickedBranches as string[];
+        }
+      }
+    }
+  }
+
+  while (true) {
+    const estimatedSizeKb = estimateTransferSizeKb({
+      preflight,
+      withHistory,
+      historyDepth,
+      branchScope,
+      selectedBranchCount: selectedBranches.length,
+    });
+    const branchLabel =
+      branchScope === "all"
+        ? `all branches (${sourceBranches.length || preflight.branchCount || "unknown"})`
+        : branchScope === "specific"
+          ? selectedBranches.join(", ")
+        : sourceBranch || "default branch";
+    const estimateLines = [
+      `History: ${color.cyan(describeHistoryChoice(withHistory, historyDepth))}`,
+      `Branches: ${color.cyan(branchLabel)}`,
+      estimatedSizeKb ? `Estimated clone/push data: ${color.cyan(formatSizeKb(estimatedSizeKb))}` : undefined,
+      preflight.sizeKb ? `Reported full repo size: ${color.dim(formatSizeKb(preflight.sizeKb))}` : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (estimateLines) {
+      if (argv.y) {
+        p.log.info(estimateLines);
+        break;
+      }
+      p.note(
+        `${estimateLines}\n\n${color.dim("Estimate is rough; Git object sharing, compression, and large blobs can change it.")}`,
+        "Estimated transfer",
+      );
+    }
+
+    const next = await p.select({
+      message: "Continue with this setup?",
+      options: [
+        { value: "continue" as const, label: "Continue", hint: "Enter the new repo URL next" },
+        { value: "reconfigure" as const, label: "Reconfigure", hint: "Change history amount or branches" },
+      ],
+      initialValue: "continue",
+    });
+    if (p.isCancel(next)) exitCancelled();
+    if (next === "continue") break;
+
+    const reconfigure = await p.multiselect({
+      message: "What do you want to reconfigure?",
+      options: [
+        { value: "history" as const, label: "History amount", hint: describeHistoryChoice(withHistory, historyDepth) },
+        {
+          value: "branches" as const,
+          label: "Branches",
+          hint:
+            branchScope === "all"
+              ? `all branches (${sourceBranches.length})`
+              : branchScope === "specific"
+                ? selectedBranches.join(", ")
+                : sourceBranch || "default branch",
+        },
+      ],
+      initialValues: ["history"],
+      required: true,
+    });
+    if (p.isCancel(reconfigure)) exitCancelled();
+    const reconfigureChoices = reconfigure as string[];
+
+    if (reconfigureChoices.includes("history")) {
+      const historyRoute = await p.select({
+        message: "How much source history should be kept?",
+        options: [
+          { value: "fast" as const, label: "Fast route", hint: "No source commit lineage; one fresh commit" },
+          { value: "limited" as const, label: "Limited history", hint: "Keep only the latest N commits" },
+          { value: "history" as const, label: "Preserve full history", hint: "Can take a long time" },
+        ],
+        initialValue: historyDepth ? "limited" : withHistory ? "history" : "fast",
+      });
+      if (p.isCancel(historyRoute)) exitCancelled();
+      if (historyRoute === "fast") {
+        withHistory = false;
+        historyDepth = undefined;
+        branchScope = "current";
+        selectedBranches = sourceBranch ? [sourceBranch] : [];
+      } else if (historyRoute === "limited") {
+        const defaultDepth = historyDepth ?? (preflight.commitCount ? Math.min(1000, preflight.commitCount) : 1000);
+        const depth = await p.text({
+          message: "How many recent commits should be kept?",
+          placeholder: String(defaultDepth),
+          initialValue: String(defaultDepth),
+          validate: (value) => (parseCommitDepth(value) ? undefined : "Enter a positive integer"),
+        });
+        if (p.isCancel(depth)) exitCancelled();
+        historyDepth = parseCommitDepth(depth as string);
+        withHistory = true;
+      } else {
+        historyDepth = undefined;
+        withHistory = true;
+      }
+    }
+
+    if (reconfigureChoices.includes("branches") && sourceBranches.length > 1 && withHistory) {
+      const nextScope = await p.select({
+        message: "Which branches should be included?",
+        options: [
+          {
+            value: "current" as const,
+            label: sourceBranch ? `Fast: only ${sourceBranch}` : "Fast: only the default branch",
+            hint: "Recommended; one branch, no tags",
+          },
+          {
+            value: "specific" as const,
+            label: "Pick specific branches",
+            hint: "Choose one or more branches",
+          },
+          {
+            value: "all" as const,
+            label: `All branches (${sourceBranches.length})`,
+            hint: "Can take a long time",
+          },
+        ],
+        initialValue: branchScope,
+      });
+      if (p.isCancel(nextScope)) exitCancelled();
+      branchScope = nextScope as BranchScope;
+      if (branchScope === "specific") {
+        const pickedBranches = await p.multiselect({
+          message: "Which branches should be included?",
+          options: branchOptions(sourceBranches, sourceBranch),
+          initialValues: selectedBranches.length ? selectedBranches : sourceBranch ? [sourceBranch] : [],
+          required: true,
+        });
+        if (p.isCancel(pickedBranches)) exitCancelled();
+        selectedBranches = pickedBranches as string[];
+      } else {
+        selectedBranches = sourceBranch ? [sourceBranch] : [];
+      }
+    }
   }
 
   let newRemote = argv.remote?.trim();
@@ -531,9 +1096,9 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
     localPath = mkdtempSync(join(tmpdir(), "hardfork-"));
   } else {
     let dirArg = argv.dir?.trim();
-    if (!dirArg && argv.y) dirArg = repoSlugFromUrl(source);
+    if (!dirArg && argv.y) dirArg = repoSlugFromUrl(sourceCloneUrl);
     if (!dirArg && !argv.y) {
-      const suggested = repoSlugFromUrl(source);
+      const suggested = repoSlugFromUrl(sourceCloneUrl);
       const d = await p.text({
         message: "Local directory name",
         placeholder: suggested,
@@ -557,9 +1122,22 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
 
   const s = p.spinner();
 
-  s.start("Cloning repository");
+  const depthLabel = historyDepth ? ` latest ${historyDepth.toLocaleString()} commits` : "";
+  const cloneBranch = branchScope === "specific" ? selectedBranches[0] : sourceBranch;
+  s.start(
+    branchScope === "all"
+      ? `Cloning all branches${depthLabel}`
+      : branchScope === "specific"
+        ? `Cloning ${selectedBranches.length} selected branch${selectedBranches.length === 1 ? "" : "es"}${depthLabel}`
+      : cloneBranch
+        ? `Cloning ${cloneBranch}${depthLabel}`
+        : `Cloning repository${depthLabel}`,
+  );
   try {
-    await cloneRepo(source, localPath, withHistory);
+    await cloneRepo(sourceCloneUrl, localPath, withHistory, cloneBranch, branchScope === "all", historyDepth);
+    if (branchScope === "specific" && selectedBranches.length > 1) {
+      await fetchSpecificBranches(localPath, selectedBranches.slice(1), historyDepth);
+    }
     s.stop(color.green("Cloned"));
   } catch (e) {
     s.stop(color.red("Clone failed"));
@@ -567,6 +1145,8 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
     if (cloneMode === "temp" && existsSync(localPath)) rmSync(localPath, { recursive: true, force: true });
     process.exit(1);
   }
+  const clonedSourceBranches =
+    branchScope === "all" ? await listClonedSourceBranches(localPath) : branchScope === "specific" ? selectedBranches : [];
 
   try {
     if (!withHistory) {
@@ -585,7 +1165,11 @@ async function runHardfork(argv: ParsedArgv): Promise<void> {
       p.log.info("  git remote set-url origin <your-repo-url>");
     }
 
-    if (shouldPush && newRemote) {
+    if (shouldPush && newRemote && (branchScope === "all" || branchScope === "specific")) {
+      s.start(`Pushing ${clonedSourceBranches.length} branches to origin`);
+      await pushClonedSourceBranches(localPath, clonedSourceBranches);
+      s.stop(color.green("Pushed branches"));
+    } else if (shouldPush && newRemote) {
       const branch = await resolveBranchToPush(localPath);
       let targetBranch = branch;
       s.start(`Pushing ${targetBranch} to origin`);
@@ -933,7 +1517,7 @@ async function runNuke(argv: NukeArgv): Promise<void> {
       if (scope === "all") {
         await cloneRepoAllBranchesShallow(repo, cwd);
       } else {
-        await cloneRepo(repo, cwd, false);
+        await cloneRepo(repo, cwd, false, undefined, false);
       }
       s.stop(color.green("Cloned"));
 
@@ -1196,10 +1780,14 @@ async function main(): Promise<void> {
     .option("source", { type: "string", description: "Source repository URL" })
     .option("remote", { type: "string", description: "New repository URL (origin)" })
     .option("dir", { type: "string", description: "Local directory for normal clone" })
+    .option("branch", { type: "string", description: "Source branch to clone" })
+    .option("all-branches", { type: "boolean", description: "Clone and push all source branches", default: false })
+    .option("current-branch-only", { type: "boolean", description: "Clone and push one branch only", default: false })
     .option("temp", { type: "boolean", description: "Temporary clone; removed after push", default: false })
     .option("normal", { type: "boolean", description: "Keep local clone", default: false })
     .option("history", { type: "boolean", description: "Keep full git history", default: false })
     .option("no-history", { type: "boolean", description: "Single fresh commit", default: false })
+    .option("depth", { type: "number", description: "Keep only the latest n commits of source history" })
     .option("push", { type: "boolean", description: "Push after setting remote", default: false })
     .option("no-push", { type: "boolean", description: "Do not push", default: false })
     .option("y", { alias: "yes", type: "boolean", default: false })
