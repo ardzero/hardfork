@@ -3,11 +3,13 @@ import * as p from "@clack/prompts";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { runHardfork, showHelp } from "@/commands/hardfork.ts";
-import { runNuke } from "@/commands/nuke.ts";
-import { runRevert } from "@/commands/revert.ts";
+import { runNuke, showNukeHelp } from "@/commands/nuke.ts";
+import { runRevert, showRevertHelp } from "@/commands/revert.ts";
 import type { NukeArgv, ParsedArgv, RevertArgv } from "@/lib/types.ts";
-import { exitCancelled } from "@/lib/prompts-util.ts";
+import { exitCancelled, installCtrlCAbortHandler } from "@/lib/prompts-util.ts";
 import { getVersion } from "@/lib/version.ts";
+
+installCtrlCAbortHandler();
 
 async function main(): Promise<void> {
   const parsed = yargs(hideBin(process.argv))
@@ -20,6 +22,15 @@ async function main(): Promise<void> {
         .option("wipe-history", { type: "boolean", default: false })
         .option("branch", { type: "string", describe: "Branch to nuke (default: main)" })
         .option("all-branches", { type: "boolean", default: false, describe: "Nuke all branches" })
+        .option("branches-only", {
+          type: "boolean",
+          default: false,
+          describe: "Delete remote branches and leave one default branch",
+        })
+        .option("default-branch", {
+          type: "string",
+          describe: "Default branch to keep/create when using --branches-only (default: main)",
+        })
         .option("message", {
           alias: "m",
           type: "string",
@@ -55,8 +66,11 @@ async function main(): Promise<void> {
     .parseSync();
 
   const argvAny = parsed as unknown as { _: unknown[]; h?: boolean; v?: boolean };
+  const first = String((parsed._[0] ?? "") as string);
   if (argvAny.h) {
-    showHelp();
+    if (first === "nuke") showNukeHelp();
+    else if (first === "revert") showRevertHelp();
+    else showHelp();
     process.exit(0);
   }
   if (argvAny.v) {
@@ -64,7 +78,6 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const first = String((parsed._[0] ?? "") as string);
   if (first === "nuke") {
     await runNuke(parsed as unknown as NukeArgv);
     return;

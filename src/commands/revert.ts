@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { execa } from "execa";
 import { INTRO_TITLE_REVERT } from "@/lib/constants.ts";
 import type { RevertArgv } from "@/lib/types.ts";
-import { exitCancelled } from "@/lib/prompts-util.ts";
+import { exitCancelled, promptUntilValue } from "@/lib/prompts-util.ts";
 import { validateCommitHash, validateRemoteUrl } from "@/lib/validation.ts";
 import {
   cloneRepoAllBranches,
@@ -14,6 +14,26 @@ import {
   getRemoteHeadBranch,
   pushToNewRemote,
 } from "@/lib/git.ts";
+
+export function showRevertHelp(): void {
+  console.clear();
+  p.intro(INTRO_TITLE_REVERT);
+  console.log(color.bold("\nUsage:"));
+  console.log(`  ${color.cyan("hardfork revert [repoUrl] [commit]")} ${color.dim("[options]")}`);
+  p.note(
+    `${color.cyan("hardfork revert https://github.com/you/repo.git abc1234")}\n  Interactive: choose branch and revert mode, then confirm\n\n` +
+      `${color.cyan("hardfork revert https://github.com/you/repo.git abc1234 --branch main --keep-history -y")}\n  Create revert commit(s) without rewriting history\n\n` +
+      `${color.cyan("hardfork revert https://github.com/you/repo.git abc1234 --branch main --destructive -y")}\n  Hard-reset the branch to the commit and force-push`,
+    "Examples",
+  );
+  console.log(color.bold("\nOptions:"));
+  console.log(`  ${color.cyan("--branch <name>")}     Branch to revert (default: remote HEAD or main)`);
+  console.log(`  ${color.cyan("--keep-history")}     Revert via new commit(s), no history rewrite`);
+  console.log(`  ${color.cyan("--destructive")}      Hard reset + force-push, rewrites history`);
+  console.log(`  ${color.cyan("-y, --yes")}          Skip prompts (requires repo and commit)`);
+  console.log(`  ${color.cyan("-h, --help")}`);
+  p.outro(color.dim("Revert: move one remote branch back to an earlier commit"));
+}
 
 export async function runRevert(argv: RevertArgv): Promise<void> {
   console.clear();
@@ -30,12 +50,13 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
     process.exit(1);
   }
   if (!repo) {
-    const t = await p.text({
-      message: "Repository URL (GitHub or GitLab)",
-      placeholder: "https://github.com/org/repo.git",
-      validate: validateRemoteUrl,
-    });
-    if (p.isCancel(t)) exitCancelled();
+    const t = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Repository URL (GitHub or GitLab)",
+        placeholder: "https://github.com/org/repo.git",
+        validate: validateRemoteUrl,
+      }),
+    );
     repo = (t as string).trim();
   }
   const repoErr = validateRemoteUrl(repo);
@@ -45,12 +66,13 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
   }
 
   if (!commit) {
-    const h = await p.text({
-      message: "Commit hash to revert to",
-      placeholder: "abc1234…",
-      validate: validateCommitHash,
-    });
-    if (p.isCancel(h)) exitCancelled();
+    const h = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Commit hash to revert to",
+        placeholder: "abc1234…",
+        validate: validateCommitHash,
+      }),
+    );
     commit = (h as string).trim();
   }
   const commitErr = validateCommitHash(commit);
@@ -62,13 +84,14 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
   const defaultBranch = (await getRemoteHeadBranch(repo)) || "main";
   let branch = argv.branch?.trim();
   if (!branch && !argv.y) {
-    const b = await p.text({
-      message: "Branch to revert",
-      placeholder: defaultBranch,
-      initialValue: defaultBranch,
-      validate: (v) => (!v?.trim() ? "Branch is required" : undefined),
-    });
-    if (p.isCancel(b)) exitCancelled();
+    const b = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Branch to revert",
+        placeholder: defaultBranch,
+        initialValue: defaultBranch,
+        validate: (v) => (!v?.trim() ? "Branch is required" : undefined),
+      }),
+    );
     branch = (b as string).trim();
   }
   if (!branch) branch = defaultBranch;
@@ -82,23 +105,24 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
   if (argv.keepHistory) mode = "keep-history";
   else if (argv.destructive) mode = "destructive";
   else if (!argv.y) {
-    const m = await p.select({
-      message: "Revert mode",
-      options: [
-        {
-          value: "keep-history" as const,
-          label: "Keep history (non-destructive)",
-          hint: "Creates new revert commit(s); does not rewrite history",
-        },
-        {
-          value: "destructive" as const,
-          label: "Destructive revert",
-          hint: "Hard-resets to the commit and force-pushes (rewrites history)",
-        },
-      ],
-      initialValue: "keep-history",
-    });
-    if (p.isCancel(m)) exitCancelled();
+    const m = await promptUntilValue<RevertMode>(() =>
+      p.select({
+        message: "Revert mode",
+        options: [
+          {
+            value: "keep-history" as const,
+            label: "Keep history (non-destructive)",
+            hint: "Creates new revert commit(s); does not rewrite history",
+          },
+          {
+            value: "destructive" as const,
+            label: "Destructive revert",
+            hint: "Hard-resets to the commit and force-pushes (rewrites history)",
+          },
+        ],
+        initialValue: "keep-history",
+      }),
+    );
     mode = m as RevertMode;
   }
 
@@ -118,14 +142,16 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
   );
 
   if (!argv.y) {
-    const ok = await p.confirm({
-      message:
-        mode === "destructive"
-          ? "Proceed with rewriting history (force-push) for that branch?"
-          : "Proceed with creating revert commit(s) on that branch?",
-      initialValue: mode !== "destructive",
-    });
-    if (p.isCancel(ok) || !ok) exitCancelled("Revert aborted");
+    const ok = await promptUntilValue<boolean>(() =>
+      p.confirm({
+        message:
+          mode === "destructive"
+            ? "Proceed with rewriting history (force-push) for that branch?"
+            : "Proceed with creating revert commit(s) on that branch?",
+        initialValue: mode !== "destructive",
+      }),
+    );
+    if (!ok) exitCancelled("Revert aborted");
   }
 
   const cwd = mkdtempSync(join(tmpdir(), "hardfork-revert-"));

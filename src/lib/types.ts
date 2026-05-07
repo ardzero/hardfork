@@ -42,7 +42,9 @@ export interface NukeArgv {
   preserveHistory?: boolean;
   wipeHistory?: boolean;
   branch?: string;
+  defaultBranch?: string;
   allBranches?: boolean;
+  branchesOnly?: boolean;
   message?: string;
   y: boolean;
   _: (string | number)[];

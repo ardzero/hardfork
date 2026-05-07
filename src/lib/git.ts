@@ -1,5 +1,5 @@
-import { cpSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { cpSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtempSync } from "node:fs";
 import { execa } from "execa";
@@ -33,6 +33,19 @@ export function preferredDefaultBranch(branches: string[], fallback: string): st
   if (branches.includes("master")) return "master";
   if (branches.includes(fallback)) return fallback;
   return branches[0] ?? fallback;
+}
+
+/** URL branch wins; else remote `HEAD` symref (host default); else main/master; never arbitrary list order. */
+export function resolveRemoteDefaultBranch(
+  branches: string[],
+  urlBranch: string | undefined,
+  remoteHead: string | undefined,
+): string | undefined {
+  if (urlBranch) return urlBranch;
+  if (remoteHead && branches.includes(remoteHead)) return remoteHead;
+  if (branches.includes("main")) return "main";
+  if (branches.includes("master")) return "master";
+  return undefined;
 }
 
 export async function gitBranchShowCurrent(cwd: string): Promise<string> {
@@ -75,6 +88,21 @@ export async function collapseToSingleCommit(cwd: string): Promise<void> {
   await execa("git", ["branch", "-m", branch], { cwd });
 }
 
+export async function collapseRemoteBranchesToSingleCommits(cwd: string, branches: string[]): Promise<void> {
+  for (const branch of branches) {
+    const orphanBranch = `__hardfork_orphan_${branch.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+    await execa("git", ["checkout", "--detach", `origin/${branch}`], { cwd, stdio: "pipe" });
+    await execa("git", ["checkout", "--orphan", orphanBranch], { cwd, stdio: "pipe" });
+    await execa("git", ["add", "-A"], { cwd, stdio: "pipe" });
+    await execa("git", ["commit", "-m", "Initial commit"], { cwd, stdio: "pipe" }).catch(async () => {
+      await execa("git", ["checkout", "--detach", `origin/${branch}`], { cwd, stdio: "pipe" }).catch(() => {});
+      throw new Error(`Nothing to commit for ${branch} after orphan checkout — empty branch?`);
+    });
+    await execa("git", ["branch", "-D", branch], { cwd, stdio: "pipe" }).catch(() => {});
+    await execa("git", ["branch", "-m", branch], { cwd, stdio: "pipe" });
+  }
+}
+
 export async function cloneRepo(
   url: string,
   dest: string,
@@ -106,6 +134,46 @@ export async function fetchSpecificBranches(cwd: string, branches: string[], dep
   }
 }
 
+export async function materializeShallowHistory(cwd: string): Promise<void> {
+  const { stdout: isShallowOut } = await execa("git", ["rev-parse", "--is-shallow-repository"], {
+    cwd,
+    stdio: "pipe",
+  });
+  if (isShallowOut.trim() !== "true") return;
+
+  const { stdout: shallowPathOut } = await execa("git", ["rev-parse", "--git-path", "shallow"], {
+    cwd,
+    stdio: "pipe",
+  });
+  const gitShallowPath = shallowPathOut.trim();
+  const shallowPath = gitShallowPath && isAbsolute(gitShallowPath) ? gitShallowPath : resolve(cwd, gitShallowPath);
+  if (!shallowPath || !existsSync(shallowPath)) return;
+
+  const boundaryCommits = readFileSync(shallowPath, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (boundaryCommits.length === 0) return;
+
+  for (const sha of boundaryCommits) {
+    await execa("git", ["replace", "--force", "--graft", sha], { cwd, stdio: "pipe" });
+  }
+
+  try {
+    await execa("git", ["filter-branch", "--force", "--", "--all"], {
+      cwd,
+      stdio: "pipe",
+      env: { FILTER_BRANCH_SQUELCH_WARNING: "1" },
+    });
+    rmSync(shallowPath, { force: true });
+  } finally {
+    for (const sha of boundaryCommits) {
+      await execa("git", ["replace", "-d", sha], { cwd, stdio: "pipe" }).catch(() => {});
+    }
+  }
+}
+
 export async function cloneRepoAllBranchesShallow(url: string, dest: string): Promise<void> {
   await execa("git", ["clone", "--no-single-branch", "--depth", "1", url, dest], { stdio: "pipe" });
 }
@@ -116,6 +184,12 @@ export async function cloneRepoAllBranches(url: string, dest: string): Promise<v
 
 export async function setOriginUrl(cwd: string, newUrl: string): Promise<void> {
   await execa("git", ["remote", "set-url", "origin", newUrl], { cwd });
+}
+
+export async function preserveSourceRemoteAndSetOrigin(cwd: string, newUrl: string): Promise<void> {
+  await execa("git", ["remote", "remove", "source"], { cwd, stdio: "pipe" }).catch(() => {});
+  await execa("git", ["remote", "rename", "origin", "source"], { cwd, stdio: "pipe" });
+  await execa("git", ["remote", "add", "origin", newUrl], { cwd, stdio: "pipe" });
 }
 
 export async function pushToNewRemote(cwd: string, branch: string): Promise<void> {
@@ -162,13 +236,34 @@ export async function listClonedSourceBranches(cwd: string): Promise<string[]> {
     .filter(Boolean);
 }
 
-export async function pushClonedSourceBranches(cwd: string, branches: string[]): Promise<void> {
-  for (const branch of branches) {
-    await execa("git", ["push", "-u", "origin", `refs/remotes/origin/${branch}:refs/heads/${branch}`], {
+export async function pushClonedSourceBranches(cwd: string, branches: string[], force = false): Promise<void> {
+  if (branches.length === 0) return;
+  await execa(
+    "git",
+    [
+      "push",
+      ...(force ? ["--force"] : []),
+      "-u",
+      "origin",
+      ...branches.map((branch) => `refs/remotes/origin/${branch}:refs/heads/${branch}`),
+    ],
+    {
       cwd,
       stdio: "inherit",
-    });
-  }
+    },
+  );
+}
+
+export async function pushLocalBranches(cwd: string, branches: string[], force = false): Promise<void> {
+  if (branches.length === 0) return;
+  await execa(
+    "git",
+    ["push", ...(force ? ["--force"] : []), "-u", "origin", ...branches.map((branch) => `${branch}:refs/heads/${branch}`)],
+    {
+      cwd,
+      stdio: "inherit",
+    },
+  );
 }
 
 export async function exportHeadTreeToDir(repoCwd: string, outDir: string): Promise<void> {
