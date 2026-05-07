@@ -3,6 +3,7 @@ import color from "picocolors";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { execa } from "execa";
 import { INTRO_TITLE } from "@/lib/constants.ts";
 import type { BranchScope, CloneMode, ParsedArgv, RepoPreflight } from "@/lib/types.ts";
@@ -63,6 +64,30 @@ function validateDestinationIsNotSource(sourceUrl: string, destinationUrl: strin
     return "Destination remote must be different from the source repository";
   }
   return undefined;
+}
+
+function terminalLink(href: string, text: string): string {
+  return `\u001B]8;;${href}\u001B\\${text}\u001B]8;;\u001B\\`;
+}
+
+function repoWebUrl(remoteUrl: string): string {
+  const normalized = remoteUrl.trim().replace(/^git\+/, "").replace(/\.git$/i, "");
+  const sshMatch = /^git@(github|gitlab)\.com:(.+)$/i.exec(normalized);
+  if (sshMatch) {
+    const [, host, repoPath] = sshMatch;
+    if (host && repoPath) return `https://${host.toLowerCase()}.com/${repoPath.replace(/^\/+/, "")}`;
+  }
+  return normalized;
+}
+
+function formatRepoLink(remoteUrl: string): string {
+  const webUrl = repoWebUrl(remoteUrl);
+  return terminalLink(webUrl, color.cyan(webUrl));
+}
+
+function formatLocalPathLink(localPath: string): string {
+  const displayPath = relative(process.cwd(), localPath) || ".";
+  return terminalLink(pathToFileURL(localPath).href, color.cyan(displayPath));
 }
 
 export function showHelp(): void {
@@ -225,7 +250,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
   };
 
   let branchScope: BranchScope = "current";
-  let selectedBranches: string[] = sourceBranch ? [sourceBranch] : [];
+  let selectedBranches: string[] = sourceBranch ? [sourceBranch] : effectiveDefaultBranch ? [effectiveDefaultBranch] : [];
   if (argv.allBranches && argv.currentBranchOnly) {
     p.log.error("Use only one of --all-branches or --current-branch-only");
     process.exit(1);
@@ -567,7 +592,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
       withHistory,
       historyDepth,
       branchScope,
-      selectedBranchCount: selectedBranches.length,
+      selectedBranchCount: branchScope === "current" ? 1 : selectedBranches.length,
     });
     const branchLabel =
       branchScope === "all"
@@ -1187,7 +1212,12 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     s.stop(color.green("Temporary clone removed"));
     p.note(`${color.cyan(newRemote ?? "")}\nYour repo now has the forked content.`, "Done");
   } else {
-    p.note(`cd ${relative(process.cwd(), localPath) || "."}`, "Done");
+    const doneLines = [
+      `cd ${formatLocalPathLink(localPath)}`,
+      `Origin repo: ${formatRepoLink(sourceCloneUrl)}`,
+      newRemote ? `Destination repo: ${formatRepoLink(newRemote)}` : `Destination repo: ${color.dim("not configured")}`,
+    ].join("\n");
+    p.note(doneLines, "Done");
   }
 
   p.outro(color.green("hardfork complete"));

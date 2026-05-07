@@ -45,6 +45,7 @@ export function resolveRemoteDefaultBranch(
   if (remoteHead && branches.includes(remoteHead)) return remoteHead;
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
+  if (branches.length === 1) return branches[0];
   return undefined;
 }
 

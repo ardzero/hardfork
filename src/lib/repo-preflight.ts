@@ -61,6 +61,10 @@ export async function getRepoSizeKb(source: SourceRepo): Promise<{ sizeKb?: numb
   return {};
 }
 
+function commitCountFromSinglePage(data: unknown): number | undefined {
+  return Array.isArray(data) ? data.length || undefined : undefined;
+}
+
 function parseLastPageFromLinkHeader(link: string | null): number | undefined {
   if (!link) return undefined;
   const last = link
@@ -82,7 +86,9 @@ export async function getRepoCommitCount(source: SourceRepo, branch?: string): P
         headers: { Accept: "application/vnd.github+json", "User-Agent": GIT_USER_AGENT },
       });
       if (!res.ok) return {};
-      return { commitCount: parseLastPageFromLinkHeader(res.headers.get("link")) };
+      const lastPage = parseLastPageFromLinkHeader(res.headers.get("link"));
+      if (lastPage) return { commitCount: lastPage };
+      return { commitCount: commitCountFromSinglePage(await res.json()) };
     }
     if (source.host === "gitlab") {
       const project = encodeURIComponent(`${source.owner}/${source.repo}`);
@@ -92,7 +98,8 @@ export async function getRepoCommitCount(source: SourceRepo, branch?: string): P
       const res = await fetch(url, { headers: { "User-Agent": GIT_USER_AGENT } });
       if (!res.ok) return {};
       const total = Number(res.headers.get("x-total"));
-      return Number.isFinite(total) && total > 0 ? { commitCount: total } : {};
+      if (Number.isFinite(total) && total > 0) return { commitCount: total };
+      return { commitCount: commitCountFromSinglePage(await res.json()) };
     }
   } catch {
     return {};
