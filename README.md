@@ -32,6 +32,172 @@ hardfork -help
 
 Clone a **source** repo, optionally point `origin` at a **new** empty repo, and push.
 
+```text
++--------------------+
+| Start: runHardfork |
++--------------------+
+          |
+          v
++------------------------------+
+| Resolve source URL           |
+| (--source / positional / UI) |
++------------------------------+
+          |
+          v
+      +------------------+
+      | Source valid +   |
+      | readable remote? |
+      +------------------+
+        | yes       | no
+        |           v
+        |     +----------------------+
+        |     | Prompt change source |
+        |     | and retry loop       |
+        |     +----------------------+
+        |____________________^
+          |
+          v
++------------------------------+
+| Choose clone mode            |
+| normal / temp                |
++------------------------------+
+          |
+          v
++------------------------------+
+| Preflight probe              |
+| branches + default + size +  |
+| commit count                 |
++------------------------------+
+          |
+          v
++------------------------------+
+| Configure branch scope       |
+| current / specific / all     |
++------------------------------+
+          |
+          v
++------------------------------+
+| Configure history            |
+| full / depth N / no-history  |
++------------------------------+
+          |
+          v
+      +----------------------+
+      | Expensive/risky      |
+      | combination?         |
+      +----------------------+
+        | no        | yes
+        |           v
+        |     +----------------------+
+        |     | Reconfigure loops:   |
+        |     | history + branches   |
+        |     +----------------------+
+        |____________________^
+          |
+          v
++------------------------------+
+| Transfer estimate screen     |
+| continue / reconfigure loop  |
++------------------------------+
+          |
+          v
++------------------------------+
+| Resolve destination remote   |
+| validate != source           |
+| check write access           |
++------------------------------+
+          |
+          v
++------------------------------+
+| Resolve push intent          |
+| temp => always push          |
++------------------------------+
+          |
+          v
++------------------------------+
+| Resolve local path           |
+| temp dir OR --dir/prompt     |
++------------------------------+
+          |
+          v
++------------------------------+
+| Clone repo (with selected    |
+| branch/history mode)         |
++------------------------------+
+          |
+          v
+      +------------------+
+      | Clone success?   |
+      +------------------+
+        | yes       | no
+        |           v
+        |     +----------------------+
+        |     | Show error, cleanup  |
+        |     | temp dir, exit       |
+        |     +----------------------+
+        |
+        v
++------------------------------+
+| Post-clone rewrite           |
+| no-history: collapse commit  |
+| depth: materialize shallow   |
++------------------------------+
+          |
+          v
+      +------------------+
+      | New remote set?  |
+      +------------------+
+        | yes       | no
+        |           v
+        |     +----------------------+
+        |     | Warn: origin still   |
+        |     | points to source     |
+        |     +----------------------+
+        v
++------------------------------+
+| Update origin URL            |
+| (special handling for        |
+| multi-branch no-history)     |
++------------------------------+
+          |
+          v
+      +----------------------+
+      | shouldPush && remote?|
+      +----------------------+
+        | no        | yes
+        |           v
+        |     +----------------------+
+        |     | Push flow            |
+        |     +----------------------+
+        |           |
+        |           v
+        |     +----------------------+
+        |     | Multi-branch?        |
+        |     +----------------------+
+        |       | yes         | no
+        |       v             v
+        | +----------------+  +-------------------------+
+        | | Keep/Nuke/Abort|  | Push single branch      |
+        | | destination    |  | if non-FF => resolve:   |
+        | | branches       |  | force / preserve /      |
+        | | then push      |  | replay / nuke-all       |
+        | +----------------+  +-------------------------+
+        |___________  _________________________________/
+                    \/
+          +----------------------+
+          | Finalize             |
+          | temp: delete folder  |
+          | normal: print cd     |
+          +----------------------+
+                    |
+                    v
+               +--------+
+               | Done   |
+               +--------+
+```
+
+The flow above mirrors the implementation in `src/commands/hardfork.ts`: preflight-driven branching, repeated reconfigure guards for risky combinations, destination safety checks, and separate push conflict strategies for multi-branch vs single-branch flows.
+
 | Step           | Interactive                                       | Flags                                               |
 | :------------- | :------------------------------------------------ | :-------------------------------------------------- |
 | Source URL     | Prompt                                            | `--source <url>` or first positional argument       |
