@@ -36,6 +36,7 @@ import {
   listRemoteBranches,
   materializeShallowHistory,
   preserveSourceRemoteAndSetOrigin,
+  probeRemoteSizeEstimatesKb,
   preferredDefaultBranch,
   resolveRemoteDefaultBranch,
   preserveRemoteHistoryButReplaceFiles,
@@ -88,6 +89,17 @@ function formatRepoLink(remoteUrl: string): string {
 function formatLocalPathLink(localPath: string): string {
   const displayPath = relative(process.cwd(), localPath) || ".";
   return terminalLink(pathToFileURL(localPath).href, color.cyan(displayPath));
+}
+
+type SpinnerLike = { start: (message: string) => void };
+
+function startRotatingSpinner(spinner: SpinnerLike, messages: string[], intervalMs = 1200): () => void {
+  if (messages.length === 0) return () => {};
+  void intervalMs;
+  // Clack's spinner.start() writes a new row each time, so timer-based rotation
+  // causes duplicate status lines. Keep one stable helpful message per phase.
+  spinner.start(messages[0] ?? "Working…");
+  return () => {};
 }
 
 export function showHelp(): void {
@@ -216,7 +228,9 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
   }
 
   const probeSpinner = p.spinner();
-  probeSpinner.start("Parsing source repository…");
+  const stopProbeSpinner = startRotatingSpinner(probeSpinner, [
+    "Parsing source repository (branches + metadata)…",
+  ]);
 
   const [sourceBranches, remoteHeadBranch] = await Promise.all([
     listRemoteBranches(sourceCloneUrl).catch(() => []),
@@ -241,6 +255,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     getRepoSizeKb(sourceRepo),
     getRepoCommitCount(sourceRepo, effectiveDefaultBranch),
   ]);
+  stopProbeSpinner();
   probeSpinner.stop(color.green("Source repository ready"));
 
   const preflight: RepoPreflight = {
@@ -248,6 +263,8 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     ...repoSize,
     ...commitCount,
   };
+  let estimatedTransferSizeProbeKb: number | undefined;
+  const shouldProbeSizeLater = !preflight.sizeKb;
 
   let branchScope: BranchScope = "current";
   let selectedBranches: string[] = sourceBranch ? [sourceBranch] : effectiveDefaultBranch ? [effectiveDefaultBranch] : [];
@@ -587,13 +604,30 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
   }
 
   while (true) {
-    const estimatedSizeKb = estimateTransferSizeKb({
-      preflight,
-      withHistory,
-      historyDepth,
-      branchScope,
-      selectedBranchCount: branchScope === "current" ? 1 : selectedBranches.length,
-    });
+    if (shouldProbeSizeLater && !preflight.sizeKb && estimatedTransferSizeProbeKb == null) {
+      const sizeProbeSpinner = p.spinner();
+      const stopSizeProbeSpinner = startRotatingSpinner(sizeProbeSpinner, [
+        "Calculating repository sizes (transfer + full checkout)…",
+      ]);
+      const probedSizes = await probeRemoteSizeEstimatesKb(sourceCloneUrl, effectiveDefaultBranch);
+      estimatedTransferSizeProbeKb = probedSizes.transferSizeKb;
+      if (probedSizes.fullRepoSizeKb) {
+        preflight.sizeKb = probedSizes.fullRepoSizeKb;
+        preflight.source = "git probe";
+      }
+      stopSizeProbeSpinner();
+      sizeProbeSpinner.stop(color.green("Repository size estimates ready"));
+    }
+    const estimatedSizeKb =
+      estimatedTransferSizeProbeKb ??
+      estimateTransferSizeKb({
+        preflight,
+        withHistory,
+        historyDepth,
+        branchScope,
+        selectedBranchCount: branchScope === "current" ? 1 : selectedBranches.length,
+      });
+    const estimatedRepoSizeKb = preflight.sizeKb;
     const branchLabel =
       branchScope === "all"
         ? `all branches (${sourceBranches.length || preflight.branchCount || "unknown"})`
@@ -603,8 +637,8 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     const estimateLines = [
       `History: ${color.cyan(describeHistoryChoice(withHistory, historyDepth))}`,
       `Branches: ${color.cyan(branchLabel)}`,
-      estimatedSizeKb ? `Estimated clone/push data: ${color.cyan(formatSizeKb(estimatedSizeKb))}` : undefined,
-      preflight.sizeKb ? `Reported full repo size: ${color.dim(formatSizeKb(preflight.sizeKb))}` : undefined,
+      `Estimated git transfer size: ${color.cyan(estimatedSizeKb ? formatSizeKb(estimatedSizeKb) : "unknown")}`,
+      `Estimated full repo size: ${color.dim(estimatedRepoSizeKb ? formatSizeKb(estimatedRepoSizeKb) : "unknown")}`,
     ]
       .filter(Boolean)
       .join("\n");

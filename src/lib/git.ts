@@ -28,6 +28,50 @@ export async function listRemoteBranches(remoteUrl: string): Promise<string[]> {
   return Array.from(new Set(branches));
 }
 
+export async function probeRemoteSizeEstimatesKb(
+  remoteUrl: string,
+  branch?: string,
+): Promise<{ transferSizeKb?: number; fullRepoSizeKb?: number }> {
+  const cwd = mkdtempSync(join(tmpdir(), "hardfork-estimate-"));
+  const bareDir = join(cwd, "probe-bare.git");
+  const checkoutDir = join(cwd, "probe-checkout");
+  try {
+    const cloneArgs = ["clone", "--bare", "--no-tags", "--single-branch"];
+    if (branch) cloneArgs.push("--branch", branch);
+    cloneArgs.push(remoteUrl, bareDir);
+    await execa("git", cloneArgs, { stdio: "pipe" });
+
+    const { stdout } = await execa("git", ["count-objects", "-v"], { cwd: bareDir, stdio: "pipe" });
+    const entries = new Map(
+      stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => line.split(":").map((part) => part.trim()))
+        .filter((parts): parts is [string, string] => parts.length === 2 && parts[0] !== "" && parts[1] !== ""),
+    );
+    const sizePackKb = Number(entries.get("size-pack") ?? "0");
+    const sizeLooseKb = Number(entries.get("size") ?? "0");
+    const transferTotalKb = sizePackKb + sizeLooseKb;
+
+    const checkoutArgs = ["clone", "--no-tags", "--single-branch"];
+    if (branch) checkoutArgs.push("--branch", branch);
+    checkoutArgs.push(remoteUrl, checkoutDir);
+    await execa("git", checkoutArgs, { stdio: "pipe" });
+    const { stdout: duOut } = await execa("du", ["-sk", checkoutDir], { stdio: "pipe" });
+    const checkoutKb = Number((duOut.trim().split(/\s+/)[0] ?? "").trim());
+    return {
+      transferSizeKb:
+        Number.isFinite(transferTotalKb) && transferTotalKb > 0 ? Math.max(1, Math.round(transferTotalKb)) : undefined,
+      fullRepoSizeKb: Number.isFinite(checkoutKb) && checkoutKb > 0 ? Math.max(1, Math.round(checkoutKb)) : undefined,
+    };
+  } catch {
+    return {};
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
 export function preferredDefaultBranch(branches: string[], fallback: string): string {
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
