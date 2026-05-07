@@ -12,12 +12,8 @@ import picocolors from "picocolors";
 const workflowConfig = {
   workflowName: `Publish ${packageJson.name} to npm`,
   watchBranches: ["main"],
-  //  Paths that trigger the workflow; 
-  watchPaths: [
-    "cli.ts",
-    "package.json",
-    // workflow file path is auto appended
-  ],
+  // Paths that trigger the workflow (CLI lives under src/).
+  watchPaths: ["src/**/*.ts", "package.json"],
   nodeVersion: "24",
   environmentName: "npm",
   // Directory only (no trailing slash required).

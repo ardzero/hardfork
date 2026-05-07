@@ -217,6 +217,12 @@ bun run gen:publish-workflow
 > **⚠️ important:**  
 > You must rerun the workflow generator if you change **any** field in the workflow config in `publish-workflow-gen.ts` or update your `package.json` (such as `name`, `version`, or any other field that might impact the workflow logic).
 
+### CLI layout (this repo)
+
+- Entry file: [`src/cli.ts`](src/cli.ts) — `bun run build` bundles it to `dist/cli.js` (the npm `bin`).
+- Subcommands live under [`src/commands/`](src/commands/) (`hardfork.ts`, `nuke.ts`, `revert.ts`); shared helpers under [`src/lib/`](src/lib/).
+- Local dev without a build: `bun run dev` (same as `bun run src/cli.ts`).
+
 ### Configs you may want to change
 
 Edit only `workflowConfig` in `publish-workflow-gen.ts`:
@@ -225,7 +231,7 @@ Edit only `workflowConfig` in `publish-workflow-gen.ts`:
 | ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
 | `workflowName`     | Workflow title (defaults to `Publish ${package.json name} to npm`)                                                            |
 | `watchBranches`    | Branches that trigger on push (e.g. `main`)                                                                                   |
-| `watchPaths`       | Path/files that trigger the worflow when changed; the workflow file path is **appended automatically** as the **last** entry  |
+| `watchPaths`       | Path globs that trigger the workflow when changed (this repo uses `src/**/*.ts` for the CLI plus `package.json`); the workflow file path is **appended automatically** as the **last** entry |
 | `nodeVersion`      | Passed to `actions/setup-node`                                                                                                |
 | `environmentName`  | GitHub job `environment:` and npm Trusted Publisher **Environment name**                                                      |
 | `workflowDir`      | Output directory (default `.github/workflows`)                                                                                |

@@ -1,5 +1,9 @@
 {
   "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
     // Environment setup & latest features
     "lib": ["ESNext"],
     "target": "ESNext",
@@ -24,5 +28,6 @@
     "noUnusedLocals": false,
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
-  }
+  },
+  "include": ["src/**/*.ts"]
 }

@@ -30,7 +30,7 @@
     "url": "git+https://github.com/ardzero/hardfork.git"
   },
   "author": "Ard Astroid <ardastroid@gmail.com>",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -41,10 +41,10 @@
     "README.md"
   ],
   "main": "./dist/cli.js",
-  "module": "cli.ts",
+  "module": "src/cli.ts",
   "scripts": {
-    "dev": "bun run cli.ts",
-    "build": "bun build cli.ts --outdir dist --target node --minify --sourcemap=external",
+    "dev": "bun run src/cli.ts",
+    "build": "bun build src/cli.ts --outdir dist --target node --minify --sourcemap=external",
     "gen:publish-workflow": "bun run publish-workflow-gen.ts",
     "prepublishOnly": "bun run build"
   },

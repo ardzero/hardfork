@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "cli.ts"
+      - "src/**/*.ts"
       - "package.json"
       - ".github/workflows/publish-package.yml"
 

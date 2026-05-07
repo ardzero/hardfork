@@ -1,0 +1,274 @@
+import { cpSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
+import { execa } from "execa";
+import type { ExecaLikeError } from "@/lib/types.ts";
+
+export async function getRemoteHeadBranch(remoteUrl: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execa("git", ["ls-remote", "--symref", remoteUrl, "HEAD"], { stdio: "pipe" });
+    const m = stdout.match(/ref:\s+refs\/heads\/([^\s]+)\s+HEAD/);
+    return m?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+export async function listRemoteBranches(remoteUrl: string): Promise<string[]> {
+  const { stdout } = await execa("git", ["ls-remote", "--heads", remoteUrl], { stdio: "pipe" });
+  const branches = stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => l.split("\t")[1] ?? "")
+    .filter((ref) => ref.startsWith("refs/heads/"))
+    .map((ref) => ref.replace(/^refs\/heads\//, ""))
+    .filter(Boolean);
+  return Array.from(new Set(branches));
+}
+
+export function preferredDefaultBranch(branches: string[], fallback: string): string {
+  if (branches.includes("main")) return "main";
+  if (branches.includes("master")) return "master";
+  if (branches.includes(fallback)) return fallback;
+  return branches[0] ?? fallback;
+}
+
+export async function gitBranchShowCurrent(cwd: string): Promise<string> {
+  const { stdout } = await execa("git", ["branch", "--show-current"], { cwd });
+  const b = stdout.trim();
+  if (b) return b;
+  const { stdout: sha } = await execa("git", ["rev-parse", "--short", "HEAD"], { cwd });
+  throw new Error(`Detached HEAD at ${sha.trim()} — check out a branch before hardfork.`);
+}
+
+async function gitDefaultBranchFromRemote(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execa("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
+      cwd,
+    });
+    const line = stdout.trim();
+    const m = /^origin\/(.+)$/.exec(line);
+    return m?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+export async function resolveBranchToPush(cwd: string): Promise<string> {
+  const current = await gitBranchShowCurrent(cwd);
+  const remoteDefault = await gitDefaultBranchFromRemote(cwd);
+  if (remoteDefault && current === remoteDefault) return current;
+  return current;
+}
+
+export async function collapseToSingleCommit(cwd: string): Promise<void> {
+  const branch = await gitBranchShowCurrent(cwd);
+  await execa("git", ["checkout", "--orphan", "__hardfork_orphan"], { cwd });
+  await execa("git", ["add", "-A"], { cwd });
+  await execa("git", ["commit", "-m", "Initial commit"], { cwd }).catch(async () => {
+    await execa("git", ["checkout", branch], { cwd }).catch(() => {});
+    throw new Error("Nothing to commit after orphan checkout — empty repo?");
+  });
+  await execa("git", ["branch", "-D", branch], { cwd });
+  await execa("git", ["branch", "-m", branch], { cwd });
+}
+
+export async function cloneRepo(
+  url: string,
+  dest: string,
+  withHistory: boolean,
+  branch: string | undefined,
+  allBranches: boolean,
+  depth?: number,
+): Promise<void> {
+  const args = ["clone"];
+  args.push("--no-tags");
+  if (allBranches) {
+    args.push("--no-single-branch");
+  } else {
+    args.push("--single-branch");
+    if (branch) args.push("--branch", branch);
+  }
+  if (depth) args.push("--depth", String(depth));
+  else if (!withHistory) args.push("--depth", "1");
+  args.push(url, dest);
+  await execa("git", args, { stdio: "pipe" });
+}
+
+export async function fetchSpecificBranches(cwd: string, branches: string[], depth?: number): Promise<void> {
+  for (const branch of branches) {
+    const args = ["fetch", "origin"];
+    if (depth) args.push("--depth", String(depth));
+    args.push(`refs/heads/${branch}:refs/remotes/origin/${branch}`);
+    await execa("git", args, { cwd, stdio: "pipe" });
+  }
+}
+
+export async function cloneRepoAllBranchesShallow(url: string, dest: string): Promise<void> {
+  await execa("git", ["clone", "--no-single-branch", "--depth", "1", url, dest], { stdio: "pipe" });
+}
+
+export async function cloneRepoAllBranches(url: string, dest: string): Promise<void> {
+  await execa("git", ["clone", "--no-single-branch", url, dest], { stdio: "pipe" });
+}
+
+export async function setOriginUrl(cwd: string, newUrl: string): Promise<void> {
+  await execa("git", ["remote", "set-url", "origin", newUrl], { cwd });
+}
+
+export async function pushToNewRemote(cwd: string, branch: string): Promise<void> {
+  await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "inherit" });
+}
+
+export function errorText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const e = err as ExecaLikeError;
+    return [e.shortMessage, e.message, e.stderr, e.stdout, e.all].filter(Boolean).join("\n");
+  }
+  return String(err);
+}
+
+export function isNonFastForwardPushError(err: unknown): boolean {
+  const msg = errorText(err);
+  return (
+    msg.includes("non-fast-forward") ||
+    msg.includes("fetch first") ||
+    msg.includes("[rejected]") ||
+    msg.includes("failed to push some refs")
+  );
+}
+
+export async function pushToNewRemoteCapture(cwd: string, branch: string): Promise<void> {
+  const res = await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "pipe", all: true });
+  if (res.all?.trim()) {
+    process.stdout.write(`${res.all}\n`);
+  }
+}
+
+export async function listClonedSourceBranches(cwd: string): Promise<string[]> {
+  const { stdout } = await execa("git", ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"], {
+    cwd,
+    stdio: "pipe",
+  });
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((ref) => ref !== "origin/HEAD")
+    .map((ref) => ref.replace(/^origin\//, ""))
+    .filter(Boolean);
+}
+
+export async function pushClonedSourceBranches(cwd: string, branches: string[]): Promise<void> {
+  for (const branch of branches) {
+    await execa("git", ["push", "-u", "origin", `refs/remotes/origin/${branch}:refs/heads/${branch}`], {
+      cwd,
+      stdio: "inherit",
+    });
+  }
+}
+
+export async function exportHeadTreeToDir(repoCwd: string, outDir: string): Promise<void> {
+  const tarPath = join(outDir, "__hardfork_head.tar");
+  await execa("git", ["archive", "-o", tarPath, "HEAD"], { cwd: repoCwd, stdio: "pipe" });
+  await execa("tar", ["-xf", tarPath, "-C", outDir], { cwd: repoCwd, stdio: "pipe" });
+  rmSync(tarPath, { force: true });
+}
+
+async function exportCommitTreeToDir(repoCwd: string, commitSha: string, outDir: string): Promise<void> {
+  const tarPath = join(outDir, "__hardfork_commit.tar");
+  await execa("git", ["archive", "-o", tarPath, commitSha], { cwd: repoCwd, stdio: "pipe" });
+  await execa("tar", ["-xf", tarPath, "-C", outDir], { cwd: repoCwd, stdio: "pipe" });
+  rmSync(tarPath, { force: true });
+}
+
+export async function preserveRemoteHistoryButReplaceFiles(params: {
+  repoCwd: string;
+  branch: string;
+  commitMessage: string;
+}): Promise<void> {
+  const { repoCwd, branch, commitMessage } = params;
+  const snapshotDir = mkdtempSync(join(tmpdir(), "hardfork-snapshot-"));
+  try {
+    await exportHeadTreeToDir(repoCwd, snapshotDir);
+
+    await execa("git", ["fetch", "origin", branch], { cwd: repoCwd, stdio: "pipe" });
+    await execa("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: repoCwd, stdio: "pipe" });
+    removeRepoContentsExceptGit(repoCwd);
+    cpSync(snapshotDir, repoCwd, { recursive: true });
+    await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+    await execa("git", ["commit", "-m", commitMessage], { cwd: repoCwd, stdio: "pipe" });
+    await pushToNewRemote(repoCwd, branch);
+  } finally {
+    rmSync(snapshotDir, { recursive: true, force: true });
+  }
+}
+
+export async function replaySourceHistoryOntoRemoteBranch(params: {
+  repoCwd: string;
+  branch: string;
+  sourceTip: string;
+  cleanupMessage: string;
+}): Promise<void> {
+  const { repoCwd, branch, sourceTip, cleanupMessage } = params;
+
+  const { stdout: revListOut } = await execa("git", ["rev-list", "--reverse", sourceTip], { cwd: repoCwd, stdio: "pipe" });
+  const sourceCommits = revListOut
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (sourceCommits.length === 0) {
+    throw new Error("Could not read source commit history to replay.");
+  }
+
+  await execa("git", ["fetch", "origin", branch], { cwd: repoCwd, stdio: "pipe" });
+  await execa("git", ["checkout", "-B", branch, `origin/${branch}`], { cwd: repoCwd, stdio: "pipe" });
+
+  removeRepoContentsExceptGit(repoCwd);
+  await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+  await execa("git", ["commit", "--allow-empty", "-m", cleanupMessage], { cwd: repoCwd, stdio: "pipe" });
+
+  for (const sha of sourceCommits) {
+    const { stdout: subject } = await execa("git", ["show", "-s", "--format=%s", sha], { cwd: repoCwd, stdio: "pipe" });
+    const { stdout: originalDate } = await execa("git", ["show", "-s", "--format=%ad", "--date=iso-strict", sha], {
+      cwd: repoCwd,
+      stdio: "pipe",
+    });
+
+    removeRepoContentsExceptGit(repoCwd);
+    await exportCommitTreeToDir(repoCwd, sha, repoCwd);
+
+    await execa("git", ["add", "-A"], { cwd: repoCwd, stdio: "pipe" });
+    const replayTitle = `${subject.trim()} / [orig ${originalDate.trim()}]`;
+    await execa("git", ["commit", "--allow-empty", "-m", `${replayTitle}\n\nsource-commit: ${sha}`], {
+      cwd: repoCwd,
+      stdio: "pipe",
+    });
+  }
+
+  await pushToNewRemote(repoCwd, branch);
+}
+
+export async function pushHeadToBranch(cwd: string, branch: string): Promise<void> {
+  await execa("git", ["push", "-u", "origin", `HEAD:${branch}`], { cwd, stdio: "inherit" });
+}
+
+export async function forcePushHeadToBranch(cwd: string, branch: string): Promise<void> {
+  await execa("git", ["push", "--force", "-u", "origin", `HEAD:${branch}`], { cwd, stdio: "inherit" });
+}
+
+export async function deleteRemoteBranch(cwd: string, branch: string): Promise<void> {
+  await execa("git", ["push", "origin", "--delete", branch], { cwd, stdio: "pipe" });
+}
+
+export function removeRepoContentsExceptGit(repoRoot: string): void {
+  const entries = readdirSync(repoRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.name === ".git") continue;
+    rmSync(join(repoRoot, entry.name), { recursive: true, force: true });
+  }
+}
