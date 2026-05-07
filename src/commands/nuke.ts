@@ -7,13 +7,16 @@ import { execa } from "execa";
 import { INTRO_TITLE_NUKE } from "@/lib/constants.ts";
 import type { NukeArgv, NukeMode } from "@/lib/types.ts";
 import { exitCancelled, promptUntilValue } from "@/lib/prompts-util.ts";
+import { assertRemoteAccessWithRecovery } from "@/lib/remote-access.ts";
 import { validateRemoteUrl } from "@/lib/validation.ts";
 import {
   cloneRepo,
   cloneRepoAllBranchesShallow,
   deleteRemoteBranch,
+  formatGitFailure,
   forcePushHeadToBranch,
   listRemoteBranches,
+  preferredDefaultBranch,
   pushHeadToBranch,
   removeRepoContentsExceptGit,
 } from "@/lib/git.ts";
@@ -31,7 +34,7 @@ export function showNukeHelp(): void {
     "Examples",
   );
   console.log(color.bold("\nOptions:"));
-  console.log(`  ${color.cyan("--branch <name>")}        Branch to nuke (default: main)`);
+  console.log(`  ${color.cyan("--branch <name>")}        Branch to nuke (default: remote HEAD/main)`);
   console.log(`  ${color.cyan("--all-branches")}         Nuke all remote branches`);
   console.log(`  ${color.cyan("--branches-only")}        Delete remote branches and leave one default branch`);
   console.log(`  ${color.cyan("--default-branch <name>")} Default branch to keep/create with --branches-only (default: main)`);
@@ -64,20 +67,42 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
     );
     repo = (t as string).trim();
   }
-  const repoErr = validateRemoteUrl(repo);
-  if (repoErr) {
-    p.log.error(repoErr);
-    process.exit(1);
+  while (true) {
+    const repoErr = validateRemoteUrl(repo);
+    if (repoErr) {
+      p.log.error(repoErr);
+      process.exit(1);
+    }
+
+    const access = await assertRemoteAccessWithRecovery({
+      remoteUrl: repo,
+      mode: "write",
+      role: "destination",
+      changeLabel: "Change target repo",
+      disabled: argv.y,
+    });
+    if (access === "ok") break;
+
+    const nextRepo = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Repository URL to nuke (GitHub or GitLab)",
+        placeholder: "https://github.com/org/repo.git",
+        initialValue: repo,
+        validate: validateRemoteUrl,
+      }),
+    );
+    repo = (nextRepo as string).trim();
   }
 
   type NukeScope = "branch" | "all" | "branches-only";
+  type DeleteBranchScope = "specific" | "all";
   if (argv.allBranches && argv.branchesOnly) {
     p.log.error("Use only one of --all-branches or --branches-only");
     process.exit(1);
   }
 
   const DEFAULT_NUKE_MESSAGE = "Nuke repository";
-  type ReconfigureChoice = "scope" | "message" | "mode" | "branch" | "default-branch";
+  type ReconfigureChoice = "nothing" | "scope" | "message" | "mode" | "branch" | "default-branch" | "delete-branches";
   let reconfigureChoices: ReconfigureChoice[] = [];
   let reconfiguring = false;
   let scope: NukeScope = argv.branchesOnly ? "branches-only" : argv.allBranches ? "all" : "branch";
@@ -86,7 +111,8 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
   const defaultBranch = "main";
   let branch: string | undefined = argv.branch?.trim();
   let keptDefaultBranch: string = argv.defaultBranch?.trim() || defaultBranch;
-  let singleBranch = branch ?? defaultBranch;
+  let selectedBranches: string[] = branch ? [branch] : [];
+  let deleteBranchScope: DeleteBranchScope = "all";
   let remoteBranches: string[] = [];
   let plannedBranches: string[] = [];
 
@@ -97,6 +123,11 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
           message: "What do you want to reconfigure?",
           options: [
             {
+              value: "nothing" as const,
+              label: "Nothing",
+              hint: "Show the confirmation again",
+            },
+            {
               value: "scope" as const,
               label: "What should be nuked?",
               hint:
@@ -104,7 +135,7 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
                   ? "Branches only"
                   : scope === "all"
                     ? "All branches"
-                    : `A specific branch (${branch ?? defaultBranch})`,
+                    : `Specific branches (${selectedBranches.length || 1})`,
             },
             ...(scope === "branches-only"
               ? [
@@ -112,6 +143,12 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
                     value: "default-branch" as const,
                     label: "Default branch to keep/create",
                     hint: keptDefaultBranch,
+                  },
+                  {
+                    value: "delete-branches" as const,
+                    label: "Branches to delete",
+                    hint:
+                      deleteBranchScope === "all" ? "All remote branches except default" : `${plannedBranches.length || selectedBranches.length} selected`,
                   },
                 ]
               : [
@@ -125,8 +162,8 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
                     ? [
                         {
                           value: "branch" as const,
-                          label: "Branch to nuke",
-                          hint: branch ?? defaultBranch,
+                          label: "Branches to nuke",
+                          hint: selectedBranches.join(", ") || branch || defaultBranch,
                         },
                       ]
                     : []),
@@ -137,6 +174,9 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
         }),
       );
       reconfigureChoices = choices as ReconfigureChoice[];
+      if (reconfigureChoices.includes("nothing")) {
+        reconfigureChoices = [];
+      }
     }
 
     const previousScope = scope;
@@ -145,12 +185,12 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
         p.select({
           message: "What should be nuked?",
           options: [
-            { value: "branch" as const, label: "A specific branch", hint: `Default: ${branch ?? defaultBranch}` },
+            { value: "branch" as const, label: "Specific branches", hint: "Select one or more remote branches" },
             { value: "all" as const, label: "All branches", hint: "Overwrites every branch in the remote" },
             {
               value: "branches-only" as const,
               label: "Branches only",
-              hint: "Delete extra remote branches and leave one default branch",
+              hint: "Delete specific or extra remote branches",
             },
           ],
           initialValue: scope,
@@ -207,19 +247,32 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
 
     if (scope === "branch") {
       if ((!branch || reconfigureChoices.includes("branch") || (scopeChanged && reconfiguring)) && !argv.y) {
-        const b = await promptUntilValue<string>(() =>
-          p.text({
-            message: "Branch to nuke",
-            placeholder: defaultBranch,
-            initialValue: branch ?? defaultBranch,
-            validate: (v) => (!v?.trim() ? "Branch is required" : undefined),
+        remoteBranches = await listRemoteBranches(repo);
+        if (remoteBranches.length === 0) {
+          p.log.error("No branches found on remote.");
+          process.exit(1);
+        }
+        const initialBranch = selectedBranches[0] ?? branch ?? preferredDefaultBranch(remoteBranches, defaultBranch);
+        const branches = await promptUntilValue<string[]>(() =>
+          p.multiselect({
+            message: "Branches to nuke",
+            options: remoteBranches.map((b) => ({ value: b, label: b })),
+            initialValues: remoteBranches.includes(initialBranch) ? [initialBranch] : [],
+            required: true,
           }),
         );
-        branch = (b as string).trim();
+        selectedBranches = branches as string[];
+        branch = selectedBranches[0];
       }
-      if (!branch) branch = defaultBranch;
+      if (selectedBranches.length === 0) selectedBranches = [branch || defaultBranch];
+      branch = selectedBranches[0];
     }
     if (scope === "branches-only") {
+      remoteBranches = await listRemoteBranches(repo);
+      if (remoteBranches.length === 0) {
+        p.log.error("No branches found on remote.");
+        process.exit(1);
+      }
       if (!keptDefaultBranch && argv.y) keptDefaultBranch = defaultBranch;
       if (
         ((!argv.defaultBranch || argv.defaultBranch.trim() === "") && !argv.y && !reconfiguring) ||
@@ -236,13 +289,59 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
         );
         keptDefaultBranch = (b as string).trim();
       }
-    }
-    singleBranch = branch ?? defaultBranch;
+      if (!argv.y && (reconfigureChoices.includes("delete-branches") || (scopeChanged && reconfiguring) || (!reconfiguring && selectedBranches.length === 0))) {
+        const deleteScope = await promptUntilValue<DeleteBranchScope>(() =>
+          p.select({
+            message: "Which branches should be deleted?",
+            options: [
+              {
+                value: "specific" as const,
+                label: "Specific branches",
+                hint: "Select one or more branches to delete",
+              },
+              {
+                value: "all" as const,
+                label: "All branches",
+                hint: `Delete every branch except ${keptDefaultBranch}`,
+              },
+            ],
+            initialValue: deleteBranchScope,
+          }),
+        );
+        deleteBranchScope = deleteScope as DeleteBranchScope;
 
-    remoteBranches = scope === "all" || scope === "branches-only" ? await listRemoteBranches(repo) : [];
+        if (deleteBranchScope === "specific") {
+          const deletableBranches = remoteBranches.filter((b) => b !== keptDefaultBranch);
+          if (deletableBranches.length === 0) {
+            p.log.error(`No branches can be deleted while keeping ${keptDefaultBranch}.`);
+            process.exit(1);
+          }
+          const branches = await promptUntilValue<string[]>(() =>
+            p.multiselect({
+              message: "Branches to delete",
+              options: deletableBranches.map((b) => ({ value: b, label: b })),
+              initialValues: selectedBranches.filter((b) => deletableBranches.includes(b)),
+              required: true,
+            }),
+          );
+          selectedBranches = branches as string[];
+        } else {
+          selectedBranches = [];
+        }
+      }
+    }
+
+    remoteBranches =
+      remoteBranches.length > 0 || (scope !== "all" && scope !== "branches-only") ? remoteBranches : await listRemoteBranches(repo);
     const plannedBranchesRaw =
-      scope === "all" ? remoteBranches : scope === "branches-only" ? remoteBranches.filter((b) => b !== keptDefaultBranch) : [singleBranch];
-    plannedBranches = scope === "branches-only" ? plannedBranchesRaw : plannedBranchesRaw.length === 0 ? [singleBranch] : plannedBranchesRaw;
+      scope === "all"
+        ? remoteBranches
+        : scope === "branches-only"
+          ? deleteBranchScope === "all"
+            ? remoteBranches.filter((b) => b !== keptDefaultBranch)
+            : selectedBranches.filter((b) => b !== keptDefaultBranch)
+          : selectedBranches;
+    plannedBranches = plannedBranchesRaw.length === 0 && scope === "branch" ? [branch || defaultBranch] : plannedBranchesRaw;
 
     const shownBranches =
       plannedBranches.length > 25
@@ -320,7 +419,7 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
       }
       s.stop(color.green("Cloned"));
 
-      const branches: string[] = scope === "all" ? await listRemoteBranches(repo) : [singleBranch];
+      const branches: string[] = scope === "all" ? await listRemoteBranches(repo) : plannedBranches;
       if (branches.length === 0) {
         throw new Error("No branches found on remote.");
       }
@@ -346,7 +445,7 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
       const branches = plannedBranches;
 
       if (branches.length === 0) {
-        const b = singleBranch;
+        const b = branch || defaultBranch;
         s.start(`Force-pushing fresh history to ${b}`);
         await forcePushHeadToBranch(cwd, b);
         s.stop(color.green("Pushed"));
@@ -360,7 +459,7 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
     }
   } catch (e) {
     s.stop(color.red("Nuke failed"));
-    p.log.error(e instanceof Error ? e.message : String(e));
+    p.log.error(await formatGitFailure(e, { operation: "git", role: "destination", remoteUrl: repo }));
     process.exit(1);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -371,7 +470,7 @@ export async function runNuke(argv: NukeArgv): Promise<void> {
       ? "all branches"
       : scope === "branches-only"
         ? `branches only; kept default: ${keptDefaultBranch}`
-        : `branch: ${branch ?? defaultBranch}`;
+        : `branches: ${plannedBranches.join(", ") || branch || defaultBranch}`;
   const doneMode = scope === "branches-only" ? "branches-only" : mode;
   p.note(`${color.cyan(repo)}\nTarget: ${color.cyan(scopeLabel)}\nMode: ${color.cyan(doneMode)}`, "Done");
   p.outro(color.green("nuke complete"));

@@ -61,6 +61,7 @@ export interface RevertArgv {
 }
 
 export type ExecaLikeError = {
+  code?: string;
   shortMessage?: string;
   message?: string;
   stderr?: string;

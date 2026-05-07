@@ -193,8 +193,10 @@ export async function preserveSourceRemoteAndSetOrigin(cwd: string, newUrl: stri
 }
 
 export async function pushToNewRemote(cwd: string, branch: string): Promise<void> {
-  await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "inherit" });
+  await runGitPush(cwd, ["push", "-u", "origin", branch]);
 }
+
+export type RemoteAccessMode = "read" | "write";
 
 export function errorText(err: unknown): string {
   if (typeof err === "string") return err;
@@ -203,6 +205,173 @@ export function errorText(err: unknown): string {
     return [e.shortMessage, e.message, e.stderr, e.stdout, e.all].filter(Boolean).join("\n");
   }
   return String(err);
+}
+
+function errorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  return (err as ExecaLikeError).code;
+}
+
+type GitFailureRole = "source" | "destination" | "local";
+
+type GitFailureContext = {
+  operation: "clone" | "push" | "fetch" | "commit" | "probe" | "git";
+  role?: GitFailureRole;
+  remoteUrl?: string;
+};
+
+async function gitConfigValue(key: string): Promise<string | undefined> {
+  return execa("git", ["config", "--get", key], { stdio: "pipe" })
+    .then(({ stdout }) => stdout.trim() || undefined)
+    .catch(() => undefined);
+}
+
+async function commandOutput(command: string, args: string[]): Promise<string | undefined> {
+  return execa(command, args, { stdio: "pipe" })
+    .then(({ stdout, stderr }) => stdout.trim() || stderr.trim() || undefined)
+    .catch(() => undefined);
+}
+
+async function currentUserInfo(): Promise<string> {
+  const [gitName, gitEmail, ghUser, ghStatus] = await Promise.all([
+    gitConfigValue("user.name"),
+    gitConfigValue("user.email"),
+    commandOutput("gh", ["api", "user", "--jq", ".login"]),
+    commandOutput("gh", ["auth", "status"]),
+  ]);
+
+  return [
+    "Current user info:",
+    `  git user.name: ${gitName ?? "(not configured)"}`,
+    `  git user.email: ${gitEmail ?? "(not configured)"}`,
+    `  GitHub CLI user: ${ghUser ?? "(not authenticated or gh not installed)"}`,
+    ghStatus ? `  gh auth status: ${ghStatus.split("\n")[0]}` : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function isGitMissingError(err: unknown): boolean {
+  const msg = errorText(err).toLowerCase();
+  return errorCode(err) === "ENOENT" || msg.includes("command not found: git") || msg.includes("spawn git enoent");
+}
+
+function isUserNotConfiguredError(err: unknown): boolean {
+  const msg = errorText(err).toLowerCase();
+  return msg.includes("author identity unknown") || msg.includes("please tell me who you are") || msg.includes("unable to auto-detect email address");
+}
+
+function isAuthOrAccessError(err: unknown): boolean {
+  const msg = errorText(err).toLowerCase();
+  return (
+    msg.includes("authentication failed") ||
+    msg.includes("permission denied") ||
+    msg.includes("could not read username") ||
+    msg.includes("repository not found") ||
+    msg.includes("not found") ||
+    msg.includes("access denied") ||
+    msg.includes("write access to repository not granted") ||
+    msg.includes("the requested url returned error: 401") ||
+    msg.includes("the requested url returned error: 403") ||
+    msg.includes("fatal: could not read from remote repository")
+  );
+}
+
+async function runGitPush(cwd: string, args: string[]): Promise<void> {
+  const res = await execa("git", args, { cwd, stdio: "pipe", all: true });
+  if (res.all?.trim()) {
+    process.stdout.write(`${res.all}\n`);
+  }
+}
+
+export async function assertRemoteAccess(remoteUrl: string, mode: RemoteAccessMode): Promise<void> {
+  if (mode === "read") {
+    await execa("git", ["ls-remote", "--heads", remoteUrl], { stdio: "pipe", all: true });
+    return;
+  }
+
+  const cwd = mkdtempSync(join(tmpdir(), "hardfork-access-"));
+  try {
+    await execa("git", ["init"], { cwd, stdio: "pipe" });
+    await execa("git", ["remote", "add", "origin", remoteUrl], { cwd, stdio: "pipe" });
+    await execa("git", ["commit", "--allow-empty", "-m", "hardfork permission check"], {
+      cwd,
+      stdio: "pipe",
+      env: {
+        GIT_AUTHOR_NAME: "hardfork",
+        GIT_AUTHOR_EMAIL: "hardfork@example.invalid",
+        GIT_COMMITTER_NAME: "hardfork",
+        GIT_COMMITTER_EMAIL: "hardfork@example.invalid",
+      },
+    });
+    await execa("git", ["push", "--dry-run", "origin", "HEAD:refs/heads/__hardfork_permission_check__"], {
+      cwd,
+      stdio: "pipe",
+      all: true,
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}
+
+function isNetworkError(err: unknown): boolean {
+  const msg = errorText(err).toLowerCase();
+  return (
+    msg.includes("could not resolve host") ||
+    msg.includes("failed to connect") ||
+    msg.includes("connection timed out") ||
+    msg.includes("connection reset") ||
+    msg.includes("network is unreachable") ||
+    msg.includes("temporary failure in name resolution") ||
+    msg.includes("operation timed out") ||
+    msg.includes("early eof") ||
+    msg.includes("rpc failed")
+  );
+}
+
+export async function formatGitFailure(err: unknown, context: GitFailureContext): Promise<string> {
+  const raw = errorText(err).trim();
+  const rawBlock = raw ? `\n\nGit said:\n${raw}` : "";
+  const remoteLine = context.remoteUrl ? `\nRemote: ${context.remoteUrl}` : "";
+
+  if (isGitMissingError(err)) {
+    return `Git is not installed or is not available on PATH.\nInstall Git, then run this command again.${rawBlock}`;
+  }
+
+  if (isUserNotConfiguredError(err)) {
+    return (
+      `Git user identity is not configured, so Git cannot create commits.\n` +
+      `Run:\n  git config --global user.name "Your Name"\n  git config --global user.email "you@example.com"\n\n` +
+      (await currentUserInfo()) +
+      rawBlock
+    );
+  }
+
+  if (isNetworkError(err)) {
+    return `Network failure while running git ${context.operation}.${remoteLine}\nCheck DNS/VPN/proxy/connectivity, then retry.${rawBlock}`;
+  }
+
+  if (isAuthOrAccessError(err)) {
+    const target =
+      context.role === "source"
+        ? "source/origin repository"
+        : context.role === "destination"
+          ? "destination repository"
+          : "repository";
+    const permissionHint =
+      context.operation === "push" || context.role === "destination"
+        ? "Make sure the authenticated account has write access to the destination repo."
+        : "If this is a private source/origin repo, authenticate with an account that can read it.";
+
+    return (
+      `Git could not access the ${target}.${remoteLine}\n` +
+      `${permissionHint}\n\n` +
+      (await currentUserInfo()) +
+      (raw ? `\n\nGit said:\n${raw}` : "")
+    );
+  }
+
+  return raw || String(err);
 }
 
 export function isNonFastForwardPushError(err: unknown): boolean {
@@ -216,10 +385,7 @@ export function isNonFastForwardPushError(err: unknown): boolean {
 }
 
 export async function pushToNewRemoteCapture(cwd: string, branch: string): Promise<void> {
-  const res = await execa("git", ["push", "-u", "origin", branch], { cwd, stdio: "pipe", all: true });
-  if (res.all?.trim()) {
-    process.stdout.write(`${res.all}\n`);
-  }
+  await runGitPush(cwd, ["push", "-u", "origin", branch]);
 }
 
 export async function listClonedSourceBranches(cwd: string): Promise<string[]> {
@@ -238,8 +404,8 @@ export async function listClonedSourceBranches(cwd: string): Promise<string[]> {
 
 export async function pushClonedSourceBranches(cwd: string, branches: string[], force = false): Promise<void> {
   if (branches.length === 0) return;
-  await execa(
-    "git",
+  await runGitPush(
+    cwd,
     [
       "push",
       ...(force ? ["--force"] : []),
@@ -247,23 +413,18 @@ export async function pushClonedSourceBranches(cwd: string, branches: string[], 
       "origin",
       ...branches.map((branch) => `refs/remotes/origin/${branch}:refs/heads/${branch}`),
     ],
-    {
-      cwd,
-      stdio: "inherit",
-    },
   );
 }
 
 export async function pushLocalBranches(cwd: string, branches: string[], force = false): Promise<void> {
   if (branches.length === 0) return;
-  await execa(
-    "git",
-    ["push", ...(force ? ["--force"] : []), "-u", "origin", ...branches.map((branch) => `${branch}:refs/heads/${branch}`)],
-    {
-      cwd,
-      stdio: "inherit",
-    },
-  );
+  await runGitPush(cwd, [
+    "push",
+    ...(force ? ["--force"] : []),
+    "-u",
+    "origin",
+    ...branches.map((branch) => `${branch}:refs/heads/${branch}`),
+  ]);
 }
 
 export async function exportHeadTreeToDir(repoCwd: string, outDir: string): Promise<void> {
@@ -349,11 +510,11 @@ export async function replaySourceHistoryOntoRemoteBranch(params: {
 }
 
 export async function pushHeadToBranch(cwd: string, branch: string): Promise<void> {
-  await execa("git", ["push", "-u", "origin", `HEAD:${branch}`], { cwd, stdio: "inherit" });
+  await runGitPush(cwd, ["push", "-u", "origin", `HEAD:${branch}`]);
 }
 
 export async function forcePushHeadToBranch(cwd: string, branch: string): Promise<void> {
-  await execa("git", ["push", "--force", "-u", "origin", `HEAD:${branch}`], { cwd, stdio: "inherit" });
+  await runGitPush(cwd, ["push", "--force", "-u", "origin", `HEAD:${branch}`]);
 }
 
 export async function deleteRemoteBranch(cwd: string, branch: string): Promise<void> {

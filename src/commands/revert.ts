@@ -7,9 +7,11 @@ import { execa } from "execa";
 import { INTRO_TITLE_REVERT } from "@/lib/constants.ts";
 import type { RevertArgv } from "@/lib/types.ts";
 import { exitCancelled, promptUntilValue } from "@/lib/prompts-util.ts";
+import { assertRemoteAccessWithRecovery } from "@/lib/remote-access.ts";
 import { validateCommitHash, validateRemoteUrl } from "@/lib/validation.ts";
 import {
   cloneRepoAllBranches,
+  formatGitFailure,
   forcePushHeadToBranch,
   getRemoteHeadBranch,
   pushToNewRemote,
@@ -59,10 +61,31 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
     );
     repo = (t as string).trim();
   }
-  const repoErr = validateRemoteUrl(repo);
-  if (repoErr) {
-    p.log.error(repoErr);
-    process.exit(1);
+  while (true) {
+    const repoErr = validateRemoteUrl(repo);
+    if (repoErr) {
+      p.log.error(repoErr);
+      process.exit(1);
+    }
+
+    const access = await assertRemoteAccessWithRecovery({
+      remoteUrl: repo,
+      mode: "write",
+      role: "destination",
+      changeLabel: "Change target repo",
+      disabled: argv.y,
+    });
+    if (access === "ok") break;
+
+    const nextRepo = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Repository URL (GitHub or GitLab)",
+        placeholder: "https://github.com/org/repo.git",
+        initialValue: repo,
+        validate: validateRemoteUrl,
+      }),
+    );
+    repo = (nextRepo as string).trim();
   }
 
   if (!commit) {
@@ -206,7 +229,7 @@ export async function runRevert(argv: RevertArgv): Promise<void> {
     }
   } catch (e) {
     s.stop(color.red("Revert failed"));
-    p.log.error(e instanceof Error ? e.message : String(e));
+    p.log.error(await formatGitFailure(e, { operation: "git", role: "destination", remoteUrl: repo }));
     process.exit(1);
   } finally {
     rmSync(cwd, { recursive: true, force: true });

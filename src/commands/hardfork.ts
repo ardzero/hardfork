@@ -27,6 +27,7 @@ import {
   collapseToSingleCommit,
   deleteRemoteBranch,
   fetchSpecificBranches,
+  formatGitFailure,
   forcePushHeadToBranch,
   getRemoteHeadBranch,
   isNonFastForwardPushError,
@@ -44,6 +45,25 @@ import {
   resolveBranchToPush,
   setOriginUrl,
 } from "@/lib/git.ts";
+import { assertRemoteAccessWithRecovery } from "@/lib/remote-access.ts";
+
+function normalizeGitRemoteUrlForComparison(value: string): string {
+  return value
+    .trim()
+    .replace(/^git\+/, "")
+    .replace(/^git@(github|gitlab)\.com:/i, "https://$1.com/")
+    .replace(/\.git$/i, "")
+    .replace(/\/+$/g, "")
+    .toLowerCase();
+}
+
+function validateDestinationIsNotSource(sourceUrl: string, destinationUrl: string | undefined): string | undefined {
+  if (!destinationUrl?.trim()) return undefined;
+  if (normalizeGitRemoteUrlForComparison(sourceUrl) === normalizeGitRemoteUrlForComparison(destinationUrl)) {
+    return "Destination remote must be different from the source repository";
+  }
+  return undefined;
+}
 
 export function showHelp(): void {
   console.clear();
@@ -106,10 +126,39 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     process.exit(1);
   }
 
-  const srcErr = validateSourceUrl(source);
-  if (srcErr) {
-    p.log.error(srcErr);
-    process.exit(1);
+  let sourceRepo = parseSourceRepo(source);
+  let sourceCloneUrl = sourceRepo.cloneUrl;
+  let sourceBranch = argv.branch?.trim() || sourceRepo.branch;
+
+  while (true) {
+    const srcErr = validateSourceUrl(source);
+    if (srcErr) {
+      p.log.error(srcErr);
+      process.exit(1);
+    }
+
+    sourceRepo = parseSourceRepo(source);
+    sourceCloneUrl = sourceRepo.cloneUrl;
+    sourceBranch = argv.branch?.trim() || sourceRepo.branch;
+
+    const access = await assertRemoteAccessWithRecovery({
+      remoteUrl: sourceCloneUrl,
+      mode: "read",
+      role: "source",
+      changeLabel: "Change source repo",
+      disabled: argv.y,
+    });
+    if (access === "ok") break;
+
+    const nextSource = await promptUntilValue<string>(() =>
+      p.text({
+        message: "Source repository URL (GitHub or GitLab)",
+        placeholder: "https://github.com/org/repo.git",
+        initialValue: source,
+        validate: validateSourceUrl,
+      }),
+    );
+    source = (nextSource as string).trim();
   }
 
   let cloneMode: CloneMode = "normal";
@@ -140,10 +189,6 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     );
     cloneMode = mode as CloneMode;
   }
-
-  const sourceRepo = parseSourceRepo(source);
-  const sourceCloneUrl = sourceRepo.cloneUrl;
-  const sourceBranch = argv.branch?.trim() || sourceRepo.branch;
 
   const probeSpinner = p.spinner();
   probeSpinner.start("Parsing source repository…");
@@ -661,7 +706,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
         p.text({
           message: "New repository URL (must exist; empty repo recommended)",
           placeholder: "git@github.com:you/fork.git",
-          validate: validateRemoteUrl,
+          validate: (value) => validateRemoteUrl(value) ?? validateDestinationIsNotSource(sourceCloneUrl, value),
         }),
       );
       newRemote = (r as string).trim();
@@ -687,11 +732,39 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
         p.text({
           message: "New remote URL",
           placeholder: "https://github.com/you/fork.git",
-          validate: validateRemoteUrl,
+          validate: (value) => validateRemoteUrl(value) ?? validateDestinationIsNotSource(sourceCloneUrl, value),
         }),
       );
       newRemote = (r as string).trim();
     }
+  }
+
+  while (newRemote) {
+    const remErr = validateRemoteUrl(newRemote);
+    const sameRemoteErr = validateDestinationIsNotSource(sourceCloneUrl, newRemote);
+    if (remErr || sameRemoteErr) {
+      p.log.error(remErr ?? sameRemoteErr ?? "Invalid destination remote");
+      process.exit(1);
+    }
+
+    const access = await assertRemoteAccessWithRecovery({
+      remoteUrl: newRemote,
+      mode: "write",
+      role: "destination",
+      changeLabel: "Change destination repo",
+      disabled: argv.y,
+    });
+    if (access === "ok") break;
+
+    const nextRemote = await promptUntilValue<string>(() =>
+      p.text({
+        message: "New remote URL",
+        placeholder: "https://github.com/you/fork.git",
+        initialValue: newRemote,
+        validate: (value) => validateRemoteUrl(value) ?? validateDestinationIsNotSource(sourceCloneUrl, value),
+      }),
+    );
+    newRemote = (nextRemote as string).trim();
   }
 
   let shouldPush = false;
@@ -769,7 +842,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     s.stop(color.green("Cloned"));
   } catch (e) {
     s.stop(color.red("Clone failed"));
-    p.log.error(e instanceof Error ? e.message : String(e));
+    p.log.error(await formatGitFailure(e, { operation: "clone", role: "source", remoteUrl: sourceCloneUrl }));
     if (cloneMode === "temp" && existsSync(localPath)) rmSync(localPath, { recursive: true, force: true });
     process.exit(1);
   }
@@ -1103,7 +1176,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
       }
     }
   } catch (e) {
-    p.log.error(e instanceof Error ? e.message : String(e));
+    p.log.error(await formatGitFailure(e, { operation: "git", role: newRemote ? "destination" : "local", remoteUrl: newRemote }));
     if (cloneMode === "temp" && existsSync(localPath)) rmSync(localPath, { recursive: true, force: true });
     process.exit(1);
   }

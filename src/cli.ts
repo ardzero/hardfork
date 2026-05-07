@@ -6,6 +6,7 @@ import { runHardfork, showHelp } from "@/commands/hardfork.ts";
 import { runNuke, showNukeHelp } from "@/commands/nuke.ts";
 import { runRevert, showRevertHelp } from "@/commands/revert.ts";
 import type { NukeArgv, ParsedArgv, RevertArgv } from "@/lib/types.ts";
+import { formatGitFailure } from "@/lib/git.ts";
 import { exitCancelled, installCtrlCAbortHandler } from "@/lib/prompts-util.ts";
 import { getVersion } from "@/lib/version.ts";
 
@@ -91,6 +92,8 @@ async function main(): Promise<void> {
 
 main().catch((err: unknown) => {
   if (p.isCancel(err)) exitCancelled();
-  p.log.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  void formatGitFailure(err, { operation: "git" }).then((message) => {
+    p.log.error(message);
+    process.exit(1);
+  });
 });
