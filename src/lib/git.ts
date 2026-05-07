@@ -33,15 +33,14 @@ export async function probeRemoteSizeEstimatesKb(
   branch?: string,
 ): Promise<{ transferSizeKb?: number; fullRepoSizeKb?: number }> {
   const cwd = mkdtempSync(join(tmpdir(), "hardfork-estimate-"));
-  const bareDir = join(cwd, "probe-bare.git");
   const checkoutDir = join(cwd, "probe-checkout");
   try {
-    const cloneArgs = ["clone", "--bare", "--no-tags", "--single-branch"];
+    const cloneArgs = ["clone", "--no-tags", "--single-branch"];
     if (branch) cloneArgs.push("--branch", branch);
-    cloneArgs.push(remoteUrl, bareDir);
+    cloneArgs.push(remoteUrl, checkoutDir);
     await execa("git", cloneArgs, { stdio: "pipe" });
 
-    const { stdout } = await execa("git", ["count-objects", "-v"], { cwd: bareDir, stdio: "pipe" });
+    const { stdout } = await execa("git", ["count-objects", "-v"], { cwd: checkoutDir, stdio: "pipe" });
     const entries = new Map(
       stdout
         .split("\n")
@@ -53,11 +52,6 @@ export async function probeRemoteSizeEstimatesKb(
     const sizePackKb = Number(entries.get("size-pack") ?? "0");
     const sizeLooseKb = Number(entries.get("size") ?? "0");
     const transferTotalKb = sizePackKb + sizeLooseKb;
-
-    const checkoutArgs = ["clone", "--no-tags", "--single-branch"];
-    if (branch) checkoutArgs.push("--branch", branch);
-    checkoutArgs.push(remoteUrl, checkoutDir);
-    await execa("git", checkoutArgs, { stdio: "pipe" });
     const { stdout: duOut } = await execa("du", ["-sk", checkoutDir], { stdio: "pipe" });
     const checkoutKb = Number((duOut.trim().split(/\s+/)[0] ?? "").trim());
     return {

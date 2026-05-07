@@ -94,12 +94,12 @@ function formatLocalPathLink(localPath: string): string {
 type SpinnerLike = { start: (message: string) => void };
 
 function startRotatingSpinner(spinner: SpinnerLike, messages: string[], intervalMs = 1200): () => void {
-  if (messages.length === 0) return () => {};
+  if (messages.length === 0) return () => { };
   void intervalMs;
   // Clack's spinner.start() writes a new row each time, so timer-based rotation
   // causes duplicate status lines. Keep one stable helpful message per phase.
   spinner.start(messages[0] ?? "Working…");
-  return () => {};
+  return () => { };
 }
 
 export function showHelp(): void {
@@ -112,11 +112,11 @@ export function showHelp(): void {
   console.log(`  ${color.cyan("bun run src/cli.ts")} ${color.dim("[options]")}`);
   p.note(
     `${color.cyan("hardfork")}\n  Interactive: source URL → clone mode → branches → history → estimate → remote → push\n\n` +
-      `${color.cyan("hardfork --source https://github.com/you/old.git --remote git@github.com:you/new.git -y")}\n  Non-interactive with push\n\n` +
-      `${color.cyan("hardfork nuke https://github.com/you/repo.git")}\n  Make a repo empty (prompt preserve vs wipe history)\n\n` +
-      `${color.cyan("hardfork revert https://github.com/you/repo.git <commit>")}\n  Move a branch back to a commit\n\n` +
-      `${color.dim("For more nuke details:")} ${color.cyan("hardfork nuke --help")}\n` +
-      `${color.dim("For more revert details:")} ${color.cyan("hardfork revert --help")}`,
+    `${color.cyan("hardfork --source https://github.com/you/old.git --remote git@github.com:you/new.git -y")}\n  Non-interactive with push\n\n` +
+    `${color.cyan("hardfork nuke https://github.com/you/repo.git")}\n  Make a repo empty (prompt preserve vs wipe history)\n\n` +
+    `${color.cyan("hardfork revert https://github.com/you/repo.git <commit>")}\n  Move a branch back to a commit\n\n` +
+    `${color.dim("For more nuke details:")} ${color.cyan("hardfork nuke --help")}\n` +
+    `${color.dim("For more revert details:")} ${color.cyan("hardfork revert --help")}`,
     "Examples",
   );
   console.log(color.bold("\nOptions:"));
@@ -244,12 +244,12 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     : undefined;
   const currentBranchOption = defaultBranchLabel
     ? {
-        value: "current" as const,
-        label: `Fast: only ${defaultBranchLabel}`,
-        hint: sourceBranch
-          ? "Branch from URL or --branch"
-          : "Remote default branch when URL has no /tree/… (from git HEAD symref, then main/master)",
-      }
+      value: "current" as const,
+      label: `Fast: only ${defaultBranchLabel}`,
+      hint: sourceBranch
+        ? "Branch from URL or --branch"
+        : "Remote default branch when URL has no /tree/… (from git HEAD symref, then main/master)",
+    }
     : undefined;
   const [repoSize, commitCount] = await Promise.all([
     getRepoSizeKb(sourceRepo),
@@ -265,6 +265,8 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
   };
   let estimatedTransferSizeProbeKb: number | undefined;
   const shouldProbeSizeLater = !preflight.sizeKb;
+  let fallbackEstimateMode: "ask" | "calculate" | "skip" = shouldProbeSizeLater && !argv.y ? "ask" : "calculate";
+  let skippedFallbackEstimate = false;
 
   let branchScope: BranchScope = "current";
   let selectedBranches: string[] = sourceBranch ? [sourceBranch] : effectiveDefaultBranch ? [effectiveDefaultBranch] : [];
@@ -353,7 +355,7 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     } else {
       p.note(
         `${detail || "This repo has a large reported history/size."}\n\n` +
-          `You can keep full history, keep only recent commits, or use a single fresh commit.`,
+        `You can keep full history, keep only recent commits, or use a single fresh commit.`,
         "Large commit history",
       );
       const historyRoute = await promptUntilValue<"fast" | "limited" | "history">(() =>
@@ -395,11 +397,11 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
   while (branchScope === "all" && allBranchesGuardExpensive && withHistory) {
     p.note(
       `This repo looks expensive to hard fork with every branch.\n` +
-        `Branches: ${color.cyan(String(preflight.branchCount))}\n` +
-        `Size: ${color.cyan(preflight.sizeKb ? formatSizeKb(preflight.sizeKb) : "unknown")}\n\n` +
-        (defaultBranchLabel
-          ? `Fast route keeps only ${color.cyan(defaultBranchLabel)} and skips tags.`
-          : `Use reconfigure to pick specific branches or continue with all branches.`),
+      `Branches: ${color.cyan(String(preflight.branchCount))}\n` +
+      `Size: ${color.cyan(preflight.sizeKb ? formatSizeKb(preflight.sizeKb) : "unknown")}\n\n` +
+      (defaultBranchLabel
+        ? `Fast route keeps only ${color.cyan(defaultBranchLabel)} and skips tags.`
+        : `Use reconfigure to pick specific branches or continue with all branches.`),
       "Large all-branches clone",
     );
     const route = await promptUntilValue<"current" | "reconfigure" | "all">(() =>
@@ -605,18 +607,35 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
 
   while (true) {
     if (shouldProbeSizeLater && !preflight.sizeKb && estimatedTransferSizeProbeKb == null) {
-      const sizeProbeSpinner = p.spinner();
-      const stopSizeProbeSpinner = startRotatingSpinner(sizeProbeSpinner, [
-        "Calculating repository sizes (transfer + full checkout)…",
-      ]);
-      const probedSizes = await probeRemoteSizeEstimatesKb(sourceCloneUrl, effectiveDefaultBranch);
-      estimatedTransferSizeProbeKb = probedSizes.transferSizeKb;
-      if (probedSizes.fullRepoSizeKb) {
-        preflight.sizeKb = probedSizes.fullRepoSizeKb;
-        preflight.source = "git probe";
+      if (fallbackEstimateMode === "ask") {
+        const estimateMode = await promptUntilValue<"calculate" | "skip">(() =>
+          p.select({
+            message: "Estimate repository sizes now?",
+            options: [
+              { value: "calculate", label: "Calculate estimates", hint: "Can take upto 10-15 seconds" },
+              { value: "skip", label: "Skip for now", hint: "Continue immediately and show unknown sizes" },
+            ],
+            initialValue: "calculate",
+          }),
+        );
+        fallbackEstimateMode = estimateMode as "calculate" | "skip";
       }
-      stopSizeProbeSpinner();
-      sizeProbeSpinner.stop(color.green("Repository size estimates ready"));
+      if (fallbackEstimateMode === "skip") {
+        skippedFallbackEstimate = true;
+      } else {
+        const sizeProbeSpinner = p.spinner();
+        const stopSizeProbeSpinner = startRotatingSpinner(sizeProbeSpinner, [
+          "Calculating repository sizes (transfer + full checkout)…",
+        ]);
+        const probedSizes = await probeRemoteSizeEstimatesKb(sourceCloneUrl, effectiveDefaultBranch);
+        estimatedTransferSizeProbeKb = probedSizes.transferSizeKb;
+        if (probedSizes.fullRepoSizeKb) {
+          preflight.sizeKb = probedSizes.fullRepoSizeKb;
+          preflight.source = "git probe";
+        }
+        stopSizeProbeSpinner();
+        sizeProbeSpinner.stop(color.green("Repository size estimates ready"));
+      }
     }
     const estimatedSizeKb =
       estimatedTransferSizeProbeKb ??
@@ -637,8 +656,8 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
     const estimateLines = [
       `History: ${color.cyan(describeHistoryChoice(withHistory, historyDepth))}`,
       `Branches: ${color.cyan(branchLabel)}`,
-      `Estimated git transfer size: ${color.cyan(estimatedSizeKb ? formatSizeKb(estimatedSizeKb) : "unknown")}`,
-      `Estimated full repo size: ${color.dim(estimatedRepoSizeKb ? formatSizeKb(estimatedRepoSizeKb) : "unknown")}`,
+      `Estimated git transfer size: ${color.cyan(estimatedSizeKb ? formatSizeKb(estimatedSizeKb) : skippedFallbackEstimate ? "skipped" : "unknown")}`,
+      `Estimated full repo size: ${color.dim(estimatedRepoSizeKb ? formatSizeKb(estimatedRepoSizeKb) : skippedFallbackEstimate ? "skipped" : "unknown")}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -993,9 +1012,9 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
 
           p.note(
             `${color.bold("This is NOT reversible.")}\n` +
-              `Remote: ${color.cyan(newRemote)}\n` +
-              `Force-push branches: ${color.cyan(clonedSourceBranches.join(", "))}\n` +
-              `Delete branches (${destinationOnlyBranches.length}): ${color.cyan(destinationOnlyBranches.join(", ") || "(none)")}`,
+            `Remote: ${color.cyan(newRemote)}\n` +
+            `Force-push branches: ${color.cyan(clonedSourceBranches.join(", "))}\n` +
+            `Delete branches (${destinationOnlyBranches.length}): ${color.cyan(destinationOnlyBranches.join(", ") || "(none)")}`,
             "Confirm nuke destination",
           );
           const confirmNuke = await promptUntilValue<"proceed" | "reconfigure" | "abort">(() =>
@@ -1088,10 +1107,10 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
 
             p.note(
               `${color.bold("This is NOT reversible.")}\n` +
-                `Remote: ${color.cyan(newRemote)}\n` +
-                `Primary branch: ${color.cyan(primaryBranch)}\n` +
-                `Delete branches (${branchesToDelete.length}): ${color.cyan(branchesToDelete.join(", ") || "(none)")}\n` +
-                `Action: ${color.cyan("force-push primary branch + delete all others")}`,
+              `Remote: ${color.cyan(newRemote)}\n` +
+              `Primary branch: ${color.cyan(primaryBranch)}\n` +
+              `Delete branches (${branchesToDelete.length}): ${color.cyan(branchesToDelete.join(", ") || "(none)")}\n` +
+              `Action: ${color.cyan("force-push primary branch + delete all others")}`,
               "Confirm nuke all branches",
             );
             const ok = await promptUntilValue<boolean>(() =>
@@ -1152,9 +1171,9 @@ export async function runHardfork(argv: ParsedArgv): Promise<void> {
           if (resolution === "force") {
             p.note(
               `${color.bold("This is NOT reversible.")}\n` +
-                `Remote: ${color.cyan(newRemote)}\n` +
-                `Branch: ${color.cyan(targetBranch)}\n` +
-                `Action: ${color.cyan("force-push overwrite")}`,
+              `Remote: ${color.cyan(newRemote)}\n` +
+              `Branch: ${color.cyan(targetBranch)}\n` +
+              `Action: ${color.cyan("force-push overwrite")}`,
               "Confirm force overwrite",
             );
             const ok = await promptUntilValue<boolean>(() =>

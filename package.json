@@ -30,7 +30,7 @@
     "url": "git+https://github.com/ardzero/hardfork.git"
   },
   "author": "Ard Astroid <ardastroid@gmail.com>",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "license": "MIT",
   "type": "module",
   "bin": {
